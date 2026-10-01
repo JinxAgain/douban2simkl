@@ -66,6 +66,8 @@ NEODB_HEADERS = {
     "Accept": "application/json",
 }
 NEODB_IMDB_PATTERN = re.compile(r"imdb\.com/title/(tt\d+)")
+NEODB_TMDB_PATTERN = re.compile(r"themoviedb\.org/(?:tv|movie)/(\d+)")
+NEODB_TVDB_PATTERN = re.compile(r"thetvdb\.com/.*?series/(\d+)")
 
 COMMON_HEADERS = {
     "User-Agent": (
@@ -104,7 +106,7 @@ def extract_season_number(title: str) -> Optional[int]:
 
 
 class ItemResolver:
-    """Resolves Douban ID to IMDb ID, and handles TV show multi-season Series ID mapping."""
+    """Resolves Douban ID to IMDb, TMDb, and TVDB IDs, and handles TV multi-season series mapping."""
 
     def __init__(self, storage: Optional[Storage] = None, session: Optional[requests.Session] = None) -> None:
         self.storage = storage
@@ -116,7 +118,7 @@ class ItemResolver:
         chunk_size: int = 100,
         on_progress: Optional[Any] = None,
     ) -> Dict[str, str]:
-        """Batch resolve Douban IDs to IMDb IDs using Wikidata SPARQL Knowledge Graph."""
+        """Batch resolve Douban IDs to IMDb, TMDb, and TVDB IDs using Wikidata SPARQL Knowledge Graph."""
         resolved_map: Dict[str, str] = {}
         valid_ids = [str(did).strip() for did in douban_ids if str(did).strip().isdigit()]
         if not valid_ids:
@@ -126,10 +128,13 @@ class ItemResolver:
             chunk = valid_ids[i : i + chunk_size]
             values_str = " ".join(f'"{did}"' for did in chunk)
             query = f"""
-            SELECT ?douban ?imdb WHERE {{
+            SELECT ?douban ?imdb ?tmdb_movie ?tmdb_tv ?tvdb WHERE {{
               VALUES ?douban {{ {values_str} }}
               ?item wdt:P4529 ?douban .
-              ?item wdt:P345 ?imdb .
+              OPTIONAL {{ ?item wdt:P345 ?imdb . }}
+              OPTIONAL {{ ?item wdt:P4985 ?tmdb_movie . }}
+              OPTIONAL {{ ?item wdt:P4983 ?tmdb_tv . }}
+              OPTIONAL {{ ?item wdt:P4835 ?tvdb . }}
             }}
             """
             try:
@@ -144,10 +149,22 @@ class ItemResolver:
                     for b in bindings:
                         did = b.get("douban", {}).get("value")
                         imdb = b.get("imdb", {}).get("value")
-                        if did and imdb and imdb.startswith("tt"):
-                            resolved_map[did] = imdb
+                        tmdb = b.get("tmdb_movie", {}).get("value") or b.get("tmdb_tv", {}).get("value")
+                        tvdb = b.get("tvdb", {}).get("value")
+
+                        imdb_val = imdb if (imdb and imdb.startswith("tt")) else None
+                        tmdb_val = str(tmdb).strip() if tmdb else None
+                        tvdb_val = str(tvdb).strip() if tvdb else None
+
+                        if did and (imdb_val or tmdb_val or tvdb_val):
+                            resolved_map[did] = imdb_val or tmdb_val or tvdb_val
                             if self.storage:
-                                self.storage.save_imdb_mapping(douban_id=did, imdb_id=imdb)
+                                self.storage.save_imdb_mapping(
+                                    douban_id=did,
+                                    imdb_id=imdb_val,
+                                    tmdb_id=tmdb_val,
+                                    tvdb_id=tvdb_val,
+                                )
                 else:
                     logger.warning("Wikidata SPARQL returned HTTP %d", resp.status_code)
             except Exception as e:
@@ -163,8 +180,9 @@ class ItemResolver:
 
         return resolved_map
 
-    def fetch_neodb_imdb_id(self, douban_id: str, timeout: int = 8) -> Optional[str]:
-        """Fetch IMDb ID from NeoDB public catalog API."""
+    def fetch_neodb_ids(self, douban_id: str, timeout: int = 8) -> Dict[str, Optional[str]]:
+        """Fetch IMDb, TMDb, and TVDB IDs from NeoDB public catalog API."""
+        result: Dict[str, Optional[str]] = {"imdb_id": None, "tmdb_id": None, "tvdb_id": None}
         douban_url = f"https://movie.douban.com/subject/{douban_id}/"
         try:
             resp = self.session.get(
@@ -178,17 +196,30 @@ class ItemResolver:
                 data = resp.json()
                 imdb = data.get("imdb")
                 if imdb and isinstance(imdb, str) and imdb.startswith("tt"):
-                    return imdb.strip()
+                    result["imdb_id"] = imdb.strip()
                 for ext in data.get("external_resources", []):
                     u = ext.get("url", "")
-                    m = NEODB_IMDB_PATTERN.search(u)
-                    if m:
-                        return m.group(1)
+                    if not result["imdb_id"]:
+                        m = NEODB_IMDB_PATTERN.search(u)
+                        if m:
+                            result["imdb_id"] = m.group(1)
+                    if not result["tmdb_id"]:
+                        m = NEODB_TMDB_PATTERN.search(u)
+                        if m:
+                            result["tmdb_id"] = m.group(1)
+                    if not result["tvdb_id"]:
+                        m = NEODB_TVDB_PATTERN.search(u)
+                        if m:
+                            result["tvdb_id"] = m.group(1)
             elif resp.status_code == 429:
                 logger.warning("NeoDB rate limit reached (HTTP 429).")
         except Exception as e:
             logger.debug("NeoDB request failed for %s: %s", douban_id, e)
-        return None
+        return result
+
+    def fetch_neodb_imdb_id(self, douban_id: str, timeout: int = 8) -> Optional[str]:
+        """Fetch IMDb ID from NeoDB public catalog API."""
+        return self.fetch_neodb_ids(douban_id, timeout=timeout).get("imdb_id")
 
     def fetch_douban_imdb_id(self, douban_id: str, max_retries: int = 2) -> Optional[str]:
         """Fetch IMDb ID directly from Douban pages with thread-safe rate limit backoff."""
@@ -239,9 +270,9 @@ class ItemResolver:
         episode_imdb_ids: List[str],
         chunk_size: int = 100,
         on_progress: Optional[Any] = None,
-    ) -> Dict[str, str]:
-        """Batch resolve TV episode/season IMDb IDs to parent Series IMDb IDs via Wikidata."""
-        series_map: Dict[str, str] = {}
+    ) -> Dict[str, Dict[str, Optional[str]]]:
+        """Batch resolve TV episode/season IMDb IDs to parent Series metadata (IMDb, TMDb, TVDB) via Wikidata."""
+        series_map: Dict[str, Dict[str, Optional[str]]] = {}
         valid_ids = list(set([str(x).strip() for x in episode_imdb_ids if str(x).strip().startswith("tt")]))
         if not valid_ids:
             return series_map
@@ -250,11 +281,13 @@ class ItemResolver:
             chunk = valid_ids[i : i + chunk_size]
             values_str = " ".join(f'"{did}"' for did in chunk)
             query = f"""
-            SELECT ?ep_imdb ?series_imdb WHERE {{
+            SELECT ?ep_imdb ?series_imdb ?series_tmdb ?series_tvdb WHERE {{
               VALUES ?ep_imdb {{ {values_str} }}
               ?ep wdt:P345 ?ep_imdb .
               ?ep (wdt:P179|wdt:P361|wdt:P4969) ?series .
-              ?series wdt:P345 ?series_imdb .
+              OPTIONAL {{ ?series wdt:P345 ?series_imdb . }}
+              OPTIONAL {{ ?series wdt:P4983 ?series_tmdb . }}
+              OPTIONAL {{ ?series wdt:P4835 ?series_tvdb . }}
             }}
             """
             try:
@@ -268,9 +301,15 @@ class ItemResolver:
                     bindings = resp.json().get("results", {}).get("bindings", [])
                     for b in bindings:
                         ep = b.get("ep_imdb", {}).get("value")
-                        series = b.get("series_imdb", {}).get("value")
-                        if ep and series and series.startswith("tt"):
-                            series_map[ep] = series
+                        s_imdb = b.get("series_imdb", {}).get("value")
+                        s_tmdb = b.get("series_tmdb", {}).get("value")
+                        s_tvdb = b.get("series_tvdb", {}).get("value")
+                        if ep and (s_imdb or s_tmdb or s_tvdb):
+                            series_map[ep] = {
+                                "series_imdb_id": s_imdb if (s_imdb and s_imdb.startswith("tt")) else None,
+                                "tmdb_id": str(s_tmdb).strip() if s_tmdb else None,
+                                "tvdb_id": str(s_tvdb).strip() if s_tvdb else None,
+                            }
             except Exception as e:
                 logger.warning("Wikidata parent series query failed: %s", e)
 
@@ -284,15 +323,20 @@ class ItemResolver:
 
         return series_map
 
-    def resolve_series_imdb_id(
+    def resolve_series_metadata(
         self,
         episode_imdb_id: str,
         tmdb_api_key: Optional[str] = None,
         omdb_api_key: Optional[str] = None,
-    ) -> Optional[str]:
-        """Convert a TV episode/season IMDb ID to the parent Series IMDb ID."""
+    ) -> Dict[str, Optional[str]]:
+        """Resolve parent series identifiers (IMDb, TMDb, TVDB) for a TV show episode."""
+        result: Dict[str, Optional[str]] = {
+            "series_imdb_id": None,
+            "tmdb_id": None,
+            "tvdb_id": None,
+        }
         if not episode_imdb_id:
-            return None
+            return result
 
         # 1. Try TMDb if API key is provided
         if tmdb_api_key:
@@ -305,16 +349,27 @@ class ItemResolver:
                 if resp.status_code == 200:
                     data = resp.json()
                     episodes = data.get("tv_episode_results", [])
+                    tv_results = data.get("tv_results", [])
+                    show_id = None
                     if episodes and "show_id" in episodes[0]:
                         show_id = episodes[0]["show_id"]
+                    elif tv_results and "id" in tv_results[0]:
+                        show_id = tv_results[0]["id"]
+
+                    if show_id:
+                        result["tmdb_id"] = str(show_id)
                         show_url = f"https://api.themoviedb.org/3/tv/{show_id}/external_ids?api_key={tmdb_api_key}"
                         show_resp = self.session.get(show_url, timeout=10)
                         if show_resp.status_code == 200:
-                            series_imdb = show_resp.json().get("imdb_id")
-                            if series_imdb:
-                                return series_imdb
-            except Exception:
-                pass
+                            ext_data = show_resp.json()
+                            if ext_data.get("imdb_id"):
+                                result["series_imdb_id"] = ext_data["imdb_id"]
+                            if ext_data.get("tvdb_id"):
+                                result["tvdb_id"] = str(ext_data["tvdb_id"])
+                        if result["series_imdb_id"] or result["tmdb_id"] or result["tvdb_id"]:
+                            return result
+            except Exception as e:
+                logger.debug("TMDb series lookup error for %s: %s", episode_imdb_id, e)
 
         # 2. Try OMDb if API key is provided
         if omdb_api_key:
@@ -323,17 +378,20 @@ class ItemResolver:
                 resp = self.session.get(omdb_url, timeout=10)
                 if resp.status_code == 200:
                     series_id = resp.json().get("seriesID")
-                    if series_id:
-                        return series_id
-            except Exception:
-                pass
+                    if series_id and series_id.startswith("tt"):
+                        result["series_imdb_id"] = series_id
+                        return result
+            except Exception as e:
+                logger.debug("OMDb series lookup error for %s: %s", episode_imdb_id, e)
 
         # 3. Try Wikidata Knowledge Graph (free, no API key required)
         query = f"""
-        SELECT ?series_imdb WHERE {{
+        SELECT ?series_imdb ?series_tmdb ?series_tvdb WHERE {{
           ?ep wdt:P345 "{episode_imdb_id}" .
           ?ep (wdt:P179|wdt:P361|wdt:P4969) ?series .
-          ?series wdt:P345 ?series_imdb .
+          OPTIONAL {{ ?series wdt:P345 ?series_imdb . }}
+          OPTIONAL {{ ?series wdt:P4983 ?series_tmdb . }}
+          OPTIONAL {{ ?series wdt:P4835 ?series_tvdb . }}
         }} LIMIT 1
         """
         try:
@@ -346,12 +404,101 @@ class ItemResolver:
             if resp.status_code == 200:
                 bindings = resp.json().get("results", {}).get("bindings", [])
                 if bindings:
-                    s_id = bindings[0].get("series_imdb", {}).get("value")
+                    b = bindings[0]
+                    s_id = b.get("series_imdb", {}).get("value")
+                    s_tmdb = b.get("series_tmdb", {}).get("value")
+                    s_tvdb = b.get("series_tvdb", {}).get("value")
                     if s_id and s_id.startswith("tt"):
-                        return s_id
+                        result["series_imdb_id"] = s_id
+                    if s_tmdb:
+                        result["tmdb_id"] = str(s_tmdb).strip()
+                    if s_tvdb:
+                        result["tvdb_id"] = str(s_tvdb).strip()
         except Exception as e:
             logger.debug("Wikidata series lookup failed for %s: %s", episode_imdb_id, e)
 
+        return result
+
+    def resolve_series_imdb_id(
+        self,
+        episode_imdb_id: str,
+        tmdb_api_key: Optional[str] = None,
+        omdb_api_key: Optional[str] = None,
+    ) -> Optional[str]:
+        """Convert a TV episode/season IMDb ID to the parent Series IMDb ID."""
+        meta = self.resolve_series_metadata(
+            episode_imdb_id=episode_imdb_id,
+            tmdb_api_key=tmdb_api_key,
+            omdb_api_key=omdb_api_key,
+        )
+        return meta.get("series_imdb_id")
+
+    def search_tmdb_title(
+        self,
+        title: str,
+        year: Optional[Any] = None,
+        is_tv: bool = False,
+        tmdb_api_key: Optional[str] = None,
+    ) -> Dict[str, Optional[str]]:
+        """Search TMDb by title and year to find IMDb, TMDb, and TVDB IDs."""
+        result: Dict[str, Optional[str]] = {"imdb_id": None, "tmdb_id": None, "tvdb_id": None}
+        if not tmdb_api_key or not title:
+            return result
+
+        clean_title = re.sub(r"第[一二两三四五六七八九十\d]+季", "", title).strip()
+        endpoint = "tv" if is_tv else "movie"
+        url = f"https://api.themoviedb.org/3/search/{endpoint}"
+        params: Dict[str, Any] = {
+            "api_key": tmdb_api_key,
+            "query": clean_title or title,
+            "language": "zh-CN",
+        }
+        if year:
+            param_key = "first_air_date_year" if is_tv else "primary_release_year"
+            params[param_key] = str(year)
+
+        try:
+            resp = self.session.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                results = resp.json().get("results", [])
+                if results and "id" in results[0]:
+                    media_id = results[0]["id"]
+                    result["tmdb_id"] = str(media_id)
+                    ext_url = f"https://api.themoviedb.org/3/{endpoint}/{media_id}/external_ids?api_key={tmdb_api_key}"
+                    ext_resp = self.session.get(ext_url, timeout=10)
+                    if ext_resp.status_code == 200:
+                        ext_data = ext_resp.json()
+                        if ext_data.get("imdb_id"):
+                            result["imdb_id"] = ext_data["imdb_id"]
+                        if ext_data.get("tvdb_id"):
+                            result["tvdb_id"] = str(ext_data["tvdb_id"])
+        except Exception as e:
+            logger.debug("TMDb search failed for '%s': %s", title, e)
+
+        return result
+
+    def search_omdb_title(
+        self,
+        title: str,
+        year: Optional[Any] = None,
+        omdb_api_key: Optional[str] = None,
+    ) -> Optional[str]:
+        """Search OMDb by title and year to find IMDb ID."""
+        if not omdb_api_key or not title:
+            return None
+        clean_title = re.sub(r"第[一二两三四五六七八九十\d]+季", "", title).strip()
+        url = "http://www.omdbapi.com/"
+        params: Dict[str, Any] = {"apikey": omdb_api_key, "t": clean_title or title}
+        if year:
+            params["y"] = str(year)
+        try:
+            resp = self.session.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                imdb_id = resp.json().get("imdbID")
+                if imdb_id and imdb_id.startswith("tt"):
+                    return imdb_id
+        except Exception as e:
+            logger.debug("OMDb search failed for '%s': %s", title, e)
         return None
 
     def resolve_item(
@@ -359,44 +506,66 @@ class ItemResolver:
         douban_id: str,
         title: str,
         is_tv: bool = False,
+        year: Optional[Any] = None,
         tmdb_api_key: Optional[str] = None,
         omdb_api_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Resolve a Douban item, prioritizing Wikidata and NeoDB before falling back to Douban."""
+        """Resolve a Douban item, prioritizing Wikidata, NeoDB, TMDb, OMDb, and Douban."""
         douban_id = str(douban_id)
         season = extract_season_number(title)
+        is_series = is_tv or (season is not None)
 
         # 1. Check local SQLite cache first (including Wikidata bulk pre-fetched items)
         if self.storage:
             cached = self.storage.get_imdb_mapping(douban_id)
-            if cached and cached.get("imdb_id"):
-                imdb_id = cached["imdb_id"]
+            if cached and (cached.get("imdb_id") or cached.get("tmdb_id") or cached.get("tvdb_id")):
+                imdb_id = cached.get("imdb_id")
+                tmdb_id = cached.get("tmdb_id")
+                tvdb_id = cached.get("tvdb_id")
                 cached_season = cached.get("season") if cached.get("season") is not None else season
                 series_imdb_id = cached.get("series_imdb_id")
+
+                # If Season > 1 and parent series ID is missing, attempt series resolution
                 if cached_season and cached_season > 1 and not series_imdb_id:
-                    series_imdb_id = self.resolve_series_imdb_id(
-                        imdb_id, tmdb_api_key=tmdb_api_key, omdb_api_key=omdb_api_key
-                    )
-                    self.storage.save_imdb_mapping(
-                        douban_id=douban_id,
-                        imdb_id=imdb_id,
-                        series_imdb_id=series_imdb_id,
-                        season=cached_season,
-                        title=title,
-                    )
+                    if imdb_id:
+                        s_meta = self.resolve_series_metadata(
+                            imdb_id, tmdb_api_key=tmdb_api_key, omdb_api_key=omdb_api_key
+                        )
+                        series_imdb_id = s_meta.get("series_imdb_id")
+                        tmdb_id = tmdb_id or s_meta.get("tmdb_id")
+                        tvdb_id = tvdb_id or s_meta.get("tvdb_id")
+
+                        self.storage.save_imdb_mapping(
+                            douban_id=douban_id,
+                            imdb_id=imdb_id,
+                            series_imdb_id=series_imdb_id,
+                            season=cached_season,
+                            title=title,
+                            tmdb_id=tmdb_id,
+                            tvdb_id=tvdb_id,
+                        )
                 return {
                     "douban_id": douban_id,
                     "imdb_id": imdb_id,
                     "series_imdb_id": series_imdb_id,
+                    "tmdb_id": tmdb_id,
+                    "tvdb_id": tvdb_id,
                     "season": cached_season,
                     "title": title or cached.get("title"),
                 }
 
         imdb_id = None
+        tmdb_id = None
+        tvdb_id = None
 
         # 2. Query NeoDB public catalog
         try:
             imdb_id = self.fetch_neodb_imdb_id(douban_id)
+            neodb_meta = self.fetch_neodb_ids(douban_id)
+            if neodb_meta:
+                imdb_id = imdb_id or neodb_meta.get("imdb_id")
+                tmdb_id = neodb_meta.get("tmdb_id")
+                tvdb_id = neodb_meta.get("tvdb_id")
             if imdb_id:
                 logger.debug("Resolved %s (%s) via NeoDB: %s", douban_id, title, imdb_id)
         except Exception as e:
@@ -411,29 +580,54 @@ class ItemResolver:
             except Exception as e:
                 logger.debug("Douban fallback resolution failed for %s: %s", douban_id, e)
 
+        # 4. Fallback: TMDb search by title + year if API key provided and no ID found
+        if tmdb_api_key and not (imdb_id or tmdb_id):
+            try:
+                tmdb_res = self.search_tmdb_title(title=title, year=year, is_tv=is_series, tmdb_api_key=tmdb_api_key)
+                imdb_id = imdb_id or tmdb_res.get("imdb_id")
+                tmdb_id = tmdb_id or tmdb_res.get("tmdb_id")
+                tvdb_id = tvdb_id or tmdb_res.get("tvdb_id")
+            except Exception as e:
+                logger.debug("TMDb search fallback failed for %s: %s", title, e)
+
+        # 5. Fallback: OMDb search by title + year if API key provided and no IMDb found
+        if omdb_api_key and not imdb_id:
+            try:
+                imdb_id = self.search_omdb_title(title=title, year=year, omdb_api_key=omdb_api_key)
+            except Exception as e:
+                logger.debug("OMDb search fallback failed for %s: %s", title, e)
+
+        # 6. Multi-season TV Series Parent Mapping
         series_imdb_id = None
-        if imdb_id and (is_tv or season is not None):
-            if season and season > 1:
-                series_imdb_id = self.resolve_series_imdb_id(
+        if (is_series or season is not None) and season and season > 1:
+            if imdb_id:
+                s_meta = self.resolve_series_metadata(
                     imdb_id, tmdb_api_key=tmdb_api_key, omdb_api_key=omdb_api_key
                 )
+                series_imdb_id = s_meta.get("series_imdb_id")
+                tmdb_id = tmdb_id or s_meta.get("tmdb_id")
+                tvdb_id = tvdb_id or s_meta.get("tvdb_id")
 
         result = {
             "douban_id": douban_id,
             "imdb_id": imdb_id,
             "series_imdb_id": series_imdb_id,
+            "tmdb_id": tmdb_id,
+            "tvdb_id": tvdb_id,
             "season": season,
             "title": title,
         }
 
-        # Save to cache
-        if self.storage and imdb_id:
+        # Save to cache if any identifier was found
+        if self.storage and (imdb_id or tmdb_id or tvdb_id):
             self.storage.save_imdb_mapping(
                 douban_id=douban_id,
                 imdb_id=imdb_id,
                 series_imdb_id=series_imdb_id,
                 season=season,
                 title=title,
+                tmdb_id=tmdb_id,
+                tvdb_id=tvdb_id,
             )
 
         return result

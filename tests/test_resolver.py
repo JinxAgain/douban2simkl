@@ -148,3 +148,75 @@ def test_resolve_item_prioritizes_neodb_over_douban():
         assert mock_neodb.call_count == 1
         assert mock_douban.call_count == 0
 
+
+def test_resolve_series_metadata_tmdb_and_tvdb():
+    resolver = ItemResolver(storage=None)
+
+    find_resp = MagicMock()
+    find_resp.status_code = 200
+    find_resp.json.return_value = {
+        "tv_episode_results": [{"show_id": 1399, "season_number": 2}]
+    }
+
+    ext_resp = MagicMock()
+    ext_resp.status_code = 200
+    ext_resp.json.return_value = {"imdb_id": "tt0944947", "tvdb_id": 121361}
+
+    with patch.object(resolver.session, "get", side_effect=[find_resp, ext_resp]):
+        meta = resolver.resolve_series_metadata("tt1480055", tmdb_api_key="fake_key")
+        assert meta["series_imdb_id"] == "tt0944947"
+        assert meta["tmdb_id"] == "1399"
+        assert meta["tvdb_id"] == "121361"
+
+
+def test_search_tmdb_title_fallback():
+    resolver = ItemResolver(storage=None)
+
+    search_resp = MagicMock()
+    search_resp.status_code = 200
+    search_resp.json.return_value = {
+        "results": [{"id": 550, "title": "Fight Club"}]
+    }
+
+    ext_resp = MagicMock()
+    ext_resp.status_code = 200
+    ext_resp.json.return_value = {"imdb_id": "tt0137523", "tvdb_id": None}
+
+    with patch.object(resolver.session, "get", side_effect=[search_resp, ext_resp]):
+        res = resolver.search_tmdb_title("搏击俱乐部", year=1999, tmdb_api_key="fake_key")
+        assert res["tmdb_id"] == "550"
+        assert res["imdb_id"] == "tt0137523"
+
+
+def test_search_omdb_title_fallback():
+    resolver = ItemResolver(storage=None)
+
+    search_resp = MagicMock()
+    search_resp.status_code = 200
+    search_resp.json.return_value = {"imdbID": "tt0137523", "Response": "True"}
+
+    with patch.object(resolver.session, "get", return_value=search_resp):
+        imdb_id = resolver.search_omdb_title("Fight Club", year=1999, omdb_api_key="fake_key")
+        assert imdb_id == "tt0137523"
+
+
+def test_fetch_neodb_ids_with_tmdb_tvdb():
+    resolver = ItemResolver(storage=None)
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "imdb": "tt13972272",
+        "external_resources": [
+            {"url": "https://www.themoviedb.org/tv/117954/season/1"},
+            {"url": "https://thetvdb.com/series/396612"},
+        ],
+    }
+
+    with patch.object(resolver.session, "get", return_value=mock_resp):
+        ids = resolver.fetch_neodb_ids("30228394")
+        assert ids["imdb_id"] == "tt13972272"
+        assert ids["tmdb_id"] == "117954"
+        assert ids["tvdb_id"] == "396612"
+
+

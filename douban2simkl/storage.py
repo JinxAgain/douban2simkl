@@ -35,7 +35,9 @@ class Storage:
                     series_imdb_id  TEXT,
                     season          INTEGER,
                     title           TEXT,
-                    updated_at      REAL
+                    updated_at      REAL,
+                    tmdb_id         TEXT,
+                    tvdb_id         TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS sync_state (
@@ -50,6 +52,11 @@ class Storage:
                 );
                 """
             )
+            for col in ("tmdb_id", "tvdb_id"):
+                try:
+                    conn.execute(f"ALTER TABLE imdb_cache ADD COLUMN {col} TEXT")
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
 
     def get_imdb_mapping(self, douban_id: str) -> Optional[Dict[str, Any]]:
@@ -65,26 +72,39 @@ class Storage:
     def save_imdb_mapping(
         self,
         douban_id: str,
-        imdb_id: Optional[str],
+        imdb_id: Optional[str] = None,
         series_imdb_id: Optional[str] = None,
         season: Optional[int] = None,
         title: Optional[str] = None,
+        tmdb_id: Optional[str] = None,
+        tvdb_id: Optional[str] = None,
     ) -> None:
-        """Store or update IMDb mapping in the cache."""
+        """Store or update IMDb/TMDb/TVDB mapping in the cache."""
         now = time.time()
         with self._get_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO imdb_cache (douban_id, imdb_id, series_imdb_id, season, title, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO imdb_cache (douban_id, imdb_id, series_imdb_id, season, title, updated_at, tmdb_id, tvdb_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(douban_id) DO UPDATE SET
-                    imdb_id = excluded.imdb_id,
-                    series_imdb_id = excluded.series_imdb_id,
-                    season = excluded.season,
-                    title = excluded.title,
+                    imdb_id = COALESCE(excluded.imdb_id, imdb_cache.imdb_id),
+                    series_imdb_id = COALESCE(excluded.series_imdb_id, imdb_cache.series_imdb_id),
+                    season = COALESCE(excluded.season, imdb_cache.season),
+                    title = COALESCE(excluded.title, imdb_cache.title),
+                    tmdb_id = COALESCE(excluded.tmdb_id, imdb_cache.tmdb_id),
+                    tvdb_id = COALESCE(excluded.tvdb_id, imdb_cache.tvdb_id),
                     updated_at = excluded.updated_at
                 """,
-                (str(douban_id), imdb_id, series_imdb_id, season, title, now),
+                (
+                    str(douban_id),
+                    imdb_id,
+                    series_imdb_id,
+                    season,
+                    title,
+                    now,
+                    str(tmdb_id) if tmdb_id else None,
+                    str(tvdb_id) if tvdb_id else None,
+                ),
             )
             conn.commit()
 

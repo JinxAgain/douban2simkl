@@ -443,15 +443,25 @@ def run_pipeline(
             series_results = resolver.batch_resolve_parent_series_wikidata(
                 ep_ids, on_progress=on_series_progress
             )
-            for ep_id, s_imdb in series_results.items():
+            for ep_id, s_data in series_results.items():
                 info = needs_series_resolution.get(ep_id)
                 if info:
+                    if isinstance(s_data, dict):
+                        s_imdb = s_data.get("series_imdb_id")
+                        s_tmdb = s_data.get("tmdb_id")
+                        s_tvdb = s_data.get("tvdb_id")
+                    else:
+                        s_imdb = s_data
+                        s_tmdb = None
+                        s_tvdb = None
                     storage.save_imdb_mapping(
                         douban_id=info["douban_id"],
                         imdb_id=ep_id,
                         series_imdb_id=s_imdb,
                         season=info["season"],
                         title=info["title"],
+                        tmdb_id=s_tmdb,
+                        tvdb_id=s_tvdb,
                     )
             console.print(
                 f"[bold green][OK] Pre-resolved {len(series_results)} parent TV series mappings via Wikidata![/bold green]\n"
@@ -459,7 +469,7 @@ def run_pipeline(
 
     workers = min(max(1, threads), 5)
     console.print(
-        f"[cyan]Resolving & syncing with [bold]{workers}[/bold] concurrent workers (NeoDB -> Douban Fallback)...[/cyan]\n"
+        f"[cyan]Resolving & syncing with [bold]{workers}[/bold] concurrent workers (TMDb / OMDb / NeoDB / Douban)...[/cyan]\n"
     )
 
     def resolve_single_record(record: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -469,12 +479,13 @@ def run_pipeline(
         is_tv = raw_type == "tv"
         cached = storage.get_imdb_mapping(douban_id)
         if not cached:
-            # Small random delay between 0.1s and 0.25s for NeoDB / external APIs
+            # Small random delay between 0.1s and 0.25s for external APIs
             time.sleep(random.uniform(0.1, 0.25))
         resolved = resolver.resolve_item(
             douban_id=douban_id,
             title=title,
             is_tv=is_tv,
+            year=record.get("year"),
             tmdb_api_key=config.TMDB_API_KEY,
             omdb_api_key=config.OMDB_API_KEY,
         )
@@ -507,6 +518,8 @@ def run_pipeline(
 
                 imdb_id = resolved.get("imdb_id")
                 series_imdb_id = resolved.get("series_imdb_id")
+                tmdb_id = resolved.get("tmdb_id")
+                tvdb_id = resolved.get("tvdb_id")
                 season = resolved.get("season")
 
                 # Calibrate rating & comment
@@ -515,14 +528,29 @@ def run_pipeline(
 
                 record_sync_status = "pending"
 
+                # Build ids dict for Simkl
+                ids_dict: Dict[str, Any] = {}
+                target_imdb = series_imdb_id or imdb_id
+                if target_imdb:
+                    ids_dict["imdb"] = target_imdb
+                if tmdb_id:
+                    ids_dict["tmdb"] = str(tmdb_id)
+                if tvdb_id:
+                    ids_dict["tvdb"] = str(tvdb_id)
+
                 # Check deduplication against Simkl library
-                target_id = series_imdb_id or imdb_id
-                if (target_id and target_id in simkl_existing_ids) or cached_sync_status == "synced":
+                is_already_in_simkl = False
+                for tid in (target_imdb, tmdb_id, tvdb_id):
+                    if tid and str(tid) in simkl_existing_ids:
+                        is_already_in_simkl = True
+                        break
+
+                if is_already_in_simkl or cached_sync_status == "synced":
                     already_in_simkl_count += 1
                     record_sync_status = "already_synced"
-                elif not imdb_id:
+                elif not ids_dict:
                     unresolved_count += 1
-                    record_sync_status = "unresolved_no_imdb"
+                    record_sync_status = "unresolved_no_id"
                     unresolved_items.append({
                         "douban_id": douban_id,
                         "title": title,
@@ -536,7 +564,7 @@ def run_pipeline(
                     if status == "done":
                         if is_tv or season:
                             show_obj: Dict[str, Any] = {
-                                "ids": {"imdb": series_imdb_id or imdb_id},
+                                "ids": ids_dict,
                                 "seasons": [{"number": season or 1}],
                             }
                             if calibrated_rating:
@@ -548,7 +576,7 @@ def run_pipeline(
                             history_shows_batch.append(show_obj)
                         else:
                             movie_obj: Dict[str, Any] = {
-                                "ids": {"imdb": imdb_id},
+                                "ids": ids_dict,
                             }
                             if calibrated_rating:
                                 movie_obj["rating"] = calibrated_rating
@@ -562,13 +590,13 @@ def run_pipeline(
                         simkl_to = "watching" if status == "doing" else "plantowatch"
                         if is_tv or season:
                             watchlist_show = {
-                                "ids": {"imdb": series_imdb_id or imdb_id},
+                                "ids": ids_dict,
                                 "to": simkl_to,
                             }
                             watchlist_shows_batch.append(watchlist_show)
                         else:
                             watchlist_movie = {
-                                "ids": {"imdb": imdb_id},
+                                "ids": ids_dict,
                                 "to": simkl_to,
                             }
                             watchlist_movies_batch.append(watchlist_movie)
@@ -592,6 +620,8 @@ def run_pipeline(
                     "rating_source": rating_source,
                     "imdb_id": imdb_id,
                     "series_imdb_id": series_imdb_id,
+                    "tmdb_id": tmdb_id,
+                    "tvdb_id": tvdb_id,
                     "season": season,
                     "comment": comment,
                     "memo_synced": memo_text,
@@ -639,9 +669,9 @@ def run_pipeline(
     else:
         table.add_row("Simkl API Errors", "0")
     if unresolved_count > 0:
-        table.add_row("Unresolved IMDb (Missing)", f"[bold yellow]{unresolved_count}[/bold yellow]")
+        table.add_row("Unresolved (Missing IDs)", f"[bold yellow]{unresolved_count}[/bold yellow]")
     else:
-        table.add_row("Unresolved IMDb (Missing)", "0")
+        table.add_row("Unresolved (Missing IDs)", "0")
     table.add_row("Long Reviews Archived (>140 chars)", str(len(long_reviews)))
 
     console.print(table)

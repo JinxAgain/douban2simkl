@@ -78,3 +78,37 @@ def test_storage_settings():
         assert storage.get_setting("token") == "secret123"
         storage.set_setting("token", "secret456")
         assert storage.get_setting("token") == "secret456"
+
+
+def test_storage_tmdb_tvdb():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "test.db")
+        storage = Storage(db_path)
+
+        storage.save_imdb_mapping(
+            douban_id="30228394",
+            imdb_id="tt13972272",
+            series_imdb_id=None,
+            season=1,
+            title="Arcane",
+            tmdb_id="117954",
+            tvdb_id="396612",
+        )
+
+        mapping = storage.get_imdb_mapping("30228394")
+        assert mapping is not None
+        assert mapping["imdb_id"] == "tt13972272"
+        assert mapping["tmdb_id"] == "117954"
+        assert mapping["tvdb_id"] == "396612"
+
+        # Test partial update coalescing
+        storage.save_imdb_mapping(
+            douban_id="30228394",
+            series_imdb_id="tt1111111",
+        )
+        updated = storage.get_imdb_mapping("30228394")
+        assert updated["imdb_id"] == "tt13972272"
+        assert updated["series_imdb_id"] == "tt1111111"
+        assert updated["tmdb_id"] == "117954"
+        assert updated["tvdb_id"] == "396612"
+
