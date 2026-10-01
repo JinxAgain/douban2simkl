@@ -196,3 +196,6 @@ class ItemResolver:
             )
 
         return result
+
+
+DoubanResolver = ItemResolver

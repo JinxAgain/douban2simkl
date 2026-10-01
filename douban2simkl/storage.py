@@ -42,6 +42,11 @@ class Storage:
                     status      TEXT,
                     synced_at   REAL
                 );
+
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key     TEXT PRIMARY KEY,
+                    value   TEXT
+                );
                 """
             )
             conn.commit()
@@ -105,5 +110,28 @@ class Storage:
                     synced_at = excluded.synced_at
                 """,
                 (str(douban_id), status, now),
+            )
+            conn.commit()
+
+    def get_setting(self, key: str) -> Optional[str]:
+        """Get an application setting by key."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT value FROM app_settings WHERE key = ?", (str(key),)
+            ).fetchone()
+            if row:
+                return str(row["value"])
+        return None
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Store or update an application setting."""
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(key), str(value)),
             )
             conn.commit()

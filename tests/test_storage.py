@@ -66,3 +66,15 @@ def test_storage_sync_status():
         # Update status
         storage.mark_synced("1292052", "skipped")
         assert storage.get_sync_status("1292052") == "skipped"
+
+
+def test_storage_settings():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "test.db")
+        storage = Storage(db_path)
+
+        assert storage.get_setting("token") is None
+        storage.set_setting("token", "secret123")
+        assert storage.get_setting("token") == "secret123"
+        storage.set_setting("token", "secret456")
+        assert storage.get_setting("token") == "secret456"

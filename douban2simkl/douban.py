@@ -211,31 +211,46 @@ def load_from_archive_file(filepath: str) -> List[Dict[str, Any]]:
             if not line:
                 continue
             item = json.loads(line)
+            douban_id = str(item.get("douban_id", "")).strip()
             link = item.get("link", "")
-            # Filter only movie.douban.com subjects
-            if "movie.douban.com" not in link:
-                continue
 
-            # Extract Douban ID from link (e.g. https://movie.douban.com/subject/1292052/)
-            match = re.search(r"/subject/(\d+)", link)
-            if not match:
-                continue
-            douban_id = match.group(1)
+            if not douban_id:
+                if "movie.douban.com" not in link:
+                    continue
+                match = re.search(r"/subject/(\d+)", link)
+                if not match:
+                    continue
+                douban_id = match.group(1)
 
-            status_raw = item.get("type", "看过")
-            status = STATUS_MAPPING.get(status_raw, "done")
+            if not link and douban_id:
+                link = f"https://movie.douban.com/subject/{douban_id}/"
+
+            raw_type = item.get("type", "看过")
+            if raw_type in ("done", "mark", "doing"):
+                status = raw_type
+                media_type = "tv" if "季" in item.get("title", "") else "movie"
+            elif raw_type in STATUS_MAPPING:
+                status = STATUS_MAPPING[raw_type]
+                media_type = "tv" if "季" in item.get("title", "") else "movie"
+            elif raw_type in ("movie", "tv"):
+                media_type = raw_type
+                status = item.get("status", "done")
+            else:
+                status = "done"
+                media_type = "tv" if "季" in item.get("title", "") else "movie"
 
             tags_raw = item.get("tags")
             tags = tags_raw.split(",") if isinstance(tags_raw, str) else (tags_raw or [])
+            rating_val = item.get("official_rating") or item.get("my_rating") or item.get("rating")
 
             records.append(
                 {
                     "douban_id": douban_id,
                     "title": item.get("title", ""),
-                    "type": "tv" if "季" in item.get("title", "") else "movie",
+                    "type": media_type,
                     "status": status,
                     "create_time": item.get("create_time"),
-                    "official_rating": item.get("my_rating"),
+                    "official_rating": rating_val,
                     "comment": item.get("comment"),
                     "tags": tags,
                     "link": link,
