@@ -12,8 +12,8 @@ else:
     load_dotenv()
 
 # Simkl client ID for PIN authentication
-# Users can set SIMKL_CLIENT_ID in their .env or will be prompted interactively
-DEFAULT_SIMKL_CLIENT_ID = ""
+# Pre-configured with default public client ID, can be overridden via .env
+DEFAULT_SIMKL_CLIENT_ID = "95d5c1b20a8710eb651a9635be8b5af3ebdd65ca114966899540b9544a9d6458"
 
 SIMKL_CLIENT_ID = os.getenv("SIMKL_CLIENT_ID", DEFAULT_SIMKL_CLIENT_ID)
 SIMKL_CLIENT_SECRET = os.getenv("SIMKL_CLIENT_SECRET", "")
