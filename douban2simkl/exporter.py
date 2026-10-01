@@ -82,9 +82,58 @@ def export_unresolved_items(records: List[Dict[str, Any]], output_path: str = "u
     return written
 
 
+def export_simkl_failed_items(records: List[Dict[str, Any]], output_path: str = "simkl_failed_sync.md") -> int:
+    """Export items that failed to sync to Simkl to a separate Markdown document with details."""
+    written = 0
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("# Simkl Sync Failed Items\n\n")
+        f.write(
+            f"> Generated on {now_str}  \n"
+            f"> Total failed items: {len(records)}  \n"
+            f"> These items had IDs resolved, but Simkl rejected them during sync (e.g., API error, invalid request, or not found in Simkl catalog).\n\n---\n\n"
+        )
+        f.write("| Douban ID | Title | Year | Type | Target Status | Simkl IDs | Error Reason | Link |\n")
+        f.write("| :--- | :--- | :---: | :---: | :---: | :--- | :--- | :--- |\n")
+        for item in records:
+            did = item.get("douban_id", "")
+            title = item.get("title", "")
+            year = item.get("year", "") or "-"
+            item_type = item.get("type", "movie")
+            target_status = item.get("target_status", "") or item.get("status", "")
+            ids_dict = item.get("ids", {})
+            if isinstance(ids_dict, dict):
+                ids_str = ", ".join(f"{k}: {v}" for k, v in ids_dict.items() if v) or "-"
+            elif isinstance(ids_dict, str):
+                ids_str = ids_dict
+            else:
+                ids_str = "-"
+            error = item.get("error", "Unknown error")
+            link = f"https://movie.douban.com/subject/{did}/"
+            f.write(
+                f"| `{did}` | **{title}** | {year} | `{item_type}` | `{target_status}` | {ids_str} | {error} | [View on Douban]({link}) |\n"
+            )
+            written += 1
+    logger.info("Exported %d Simkl failed items to %s", written, output_path)
+    return written
+
+
 def generate_sync_report(stats: Dict[str, Any], output_path: str = "sync_report.md") -> str:
     """Generate a Markdown sync summary report."""
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    has_simkl_errors = stats.get("simkl_errors", 0) > 0
+    has_unresolved = stats.get("unresolved", 0) > 0
+
+    files_list = [
+        "- Full enriched backup: `douban_full_backup.jsonl`",
+        "- Long reviews archive: `long_reviews_archive.md`",
+    ]
+    if has_unresolved:
+        files_list.append("- Unresolved items list: `unresolved_items.md` (missing IMDb/TMDb)")
+    if has_simkl_errors:
+        files_list.append("- Simkl failed sync list: `simkl_failed_sync.md` (Simkl API errors)")
+    files_list.append("- Local cache database: `douban2simkl.db`")
+
     report = f"""# Douban to Simkl Sync Report
 
 **Generated At**: {now_str}
@@ -101,10 +150,7 @@ def generate_sync_report(stats: Dict[str, Any], output_path: str = "sync_report.
 
 ## Files Generated
 
-- Full enriched backup: `douban_full_backup.jsonl`
-- Long reviews archive: `long_reviews_archive.md`
-- Unresolved items list: `unresolved_items.md` (if any missing IMDb)
-- Local cache database: `douban2simkl.db`
+{chr(10).join(files_list)}
 """
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(report)

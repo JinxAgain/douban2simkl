@@ -4,7 +4,7 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager
-from typing import Optional, Dict, Any, Generator
+from typing import Optional, Dict, Any, Generator, List
 
 
 class Storage:
@@ -156,3 +156,18 @@ class Storage:
                 (str(key), str(value)),
             )
             conn.commit()
+
+    def get_failed_sync_records(self) -> List[Dict[str, Any]]:
+        """Retrieve all records from sync_state where status is not 'synced' joined with cached IMDb metadata."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.douban_id, s.status, s.synced_at,
+                       i.title, i.imdb_id, i.series_imdb_id, i.tmdb_id, i.tvdb_id, i.season
+                FROM sync_state s
+                LEFT JOIN imdb_cache i ON s.douban_id = i.douban_id
+                WHERE s.status != 'synced'
+                ORDER BY s.synced_at DESC
+                """
+            ).fetchall()
+            return [dict(r) for r in rows]

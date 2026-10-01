@@ -9,6 +9,8 @@ venv/
 # Environment and sensitive files
 .env
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 
@@ -17,7 +19,10 @@ douban_archive.jsonl
 douban_full_backup.jsonl
 long_reviews_archive.md
 sync_report*.md
+unresolved_items.md
+simkl_failed_sync.md
 *.backup
+scratch/
 
 # Cloned reference projects (if submodule/vendored)
 douban-idatabase/

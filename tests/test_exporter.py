@@ -106,3 +106,45 @@ def test_export_unresolved_items(tmp_path):
     assert "未知短片" in content
     assert "99999999" in content
 
+
+def test_export_simkl_failed_items(tmp_path):
+    from douban2simkl.exporter import export_simkl_failed_items
+
+    output_file = tmp_path / "simkl_failed_sync.md"
+    records = [
+        {
+            "douban_id": "1292052",
+            "title": "肖申克的救赎",
+            "year": 1994,
+            "type": "movie",
+            "status": "mark",
+            "target_status": "plantowatch",
+            "ids": {"imdb": "tt0111161", "tmdb": "278"},
+            "error": "400 Client Error: Bad Request",
+        },
+        {
+            "douban_id": "35288767",
+            "title": "大山里的女校",
+            "year": 2024,
+            "type": "tv",
+            "status": "doing",
+            "target_status": "watching",
+            "ids": {"imdb": "tt32849202"},
+            "error": "Not found in Simkl catalog",
+        },
+    ]
+
+    count = export_simkl_failed_items(records, str(output_file))
+    assert count == 2
+    assert os.path.exists(output_file)
+    content = output_file.read_text(encoding="utf-8")
+    assert "# Simkl Sync Failed Items" in content
+    assert "肖申克的救赎" in content
+    assert "大山里的女校" in content
+    assert "400 Client Error: Bad Request" in content
+    assert "Not found in Simkl catalog" in content
+    assert "plantowatch" in content
+    assert "watching" in content
+    assert "tt0111161" in content
+    assert "https://movie.douban.com/subject/1292052/" in content
+

@@ -35,6 +35,7 @@ from douban2simkl.douban import DoubanClient, get_douban_client, load_from_archi
 from douban2simkl.exporter import (
     export_full_backup,
     export_long_reviews,
+    export_simkl_failed_items,
     export_unresolved_items,
     generate_sync_report,
 )
@@ -302,6 +303,9 @@ def run_pipeline(
     watchlist_shows_batch: List[Dict[str, Any]] = []
     pending_history_ids: List[str] = []
     pending_watchlist_ids: List[str] = []
+    pending_history_meta: List[Dict[str, Any]] = []
+    pending_watchlist_meta: List[Dict[str, Any]] = []
+    failed_sync_items: List[Dict[str, Any]] = []
 
     def flush_batches() -> None:
         nonlocal synced_count, simkl_errors_count
@@ -309,60 +313,100 @@ def run_pipeline(
             synced_count += len(pending_history_ids) + len(pending_watchlist_ids)
             pending_history_ids.clear()
             pending_watchlist_ids.clear()
+            pending_history_meta.clear()
+            pending_watchlist_meta.clear()
             history_movies_batch.clear()
             history_shows_batch.clear()
             watchlist_movies_batch.clear()
             watchlist_shows_batch.clear()
             return
 
+        # 1. Push history batch (POST /sync/history)
         if history_movies_batch or history_shows_batch:
             try:
-                simkl_client.sync_history_batch(
+                resp = simkl_client.sync_history_batch(
                     movies=history_movies_batch if history_movies_batch else None,
                     shows=history_shows_batch if history_shows_batch else None,
                 )
-                for did in pending_history_ids:
-                    storage.mark_synced(did, "synced")
-                synced_count += len(pending_history_ids)
+                not_found_ids: Set[str] = set()
+                not_found_section = resp.get("not_found", {}) if isinstance(resp, dict) else {}
+                for nf_list in not_found_section.values():
+                    if isinstance(nf_list, list):
+                        for nf_item in nf_list:
+                            if isinstance(nf_item, dict):
+                                for val in nf_item.get("ids", {}).values():
+                                    if val:
+                                        not_found_ids.add(str(val).lower().strip())
+
+                for meta in pending_history_meta:
+                    did = meta["douban_id"]
+                    item_ids = {str(v).lower().strip() for v in meta.get("ids", {}).values() if v}
+                    if item_ids and item_ids.intersection(not_found_ids):
+                        err_msg = "Not found in Simkl catalog"
+                        storage.mark_synced(did, f"error: {err_msg}")
+                        failed_rec = dict(meta)
+                        failed_rec["error"] = err_msg
+                        failed_sync_items.append(failed_rec)
+                        simkl_errors_count += 1
+                    else:
+                        storage.mark_synced(did, "synced")
+                        synced_count += 1
             except Exception as e:
-                logger.error("Failed to push history batch: %s", e)
-                for did in pending_history_ids:
-                    storage.mark_synced(did, f"error: {e}")
+                err_msg = str(e)
+                logger.error("Failed to push history batch: %s", err_msg)
+                for meta in pending_history_meta:
+                    did = meta["douban_id"]
+                    storage.mark_synced(did, f"error: {err_msg}")
+                    failed_rec = dict(meta)
+                    failed_rec["error"] = err_msg
+                    failed_sync_items.append(failed_rec)
                 simkl_errors_count += len(pending_history_ids)
 
+        # 2. Push watchlist batch (POST /sync/add-to-list)
         if watchlist_movies_batch or watchlist_shows_batch:
-            by_status_movies: Dict[str, List[Dict[str, Any]]] = {}
-            for it in watchlist_movies_batch:
-                st = it.pop("to", "plantowatch")
-                by_status_movies.setdefault(st, []).append(it)
+            try:
+                resp = simkl_client.add_to_list_batch(
+                    movies=watchlist_movies_batch if watchlist_movies_batch else None,
+                    shows=watchlist_shows_batch if watchlist_shows_batch else None,
+                )
+                not_found_ids = set()
+                not_found_section = resp.get("not_found", {}) if isinstance(resp, dict) else {}
+                for nf_list in not_found_section.values():
+                    if isinstance(nf_list, list):
+                        for nf_item in nf_list:
+                            if isinstance(nf_item, dict):
+                                for val in nf_item.get("ids", {}).values():
+                                    if val:
+                                        not_found_ids.add(str(val).lower().strip())
 
-            by_status_shows: Dict[str, List[Dict[str, Any]]] = {}
-            for it in watchlist_shows_batch:
-                st = it.pop("to", "plantowatch")
-                by_status_shows.setdefault(st, []).append(it)
-
-            all_statuses = set(by_status_movies.keys()) | set(by_status_shows.keys())
-            success = True
-            for st in all_statuses:
-                m_items = by_status_movies.get(st)
-                s_items = by_status_shows.get(st)
-                try:
-                    simkl_client.add_to_list_batch(movies=m_items, shows=s_items, to=st)
-                except Exception as e:
-                    logger.error("Failed to push watchlist batch (%s): %s", st, e)
-                    success = False
-
-            if success:
-                for did in pending_watchlist_ids:
-                    storage.mark_synced(did, "synced")
-                synced_count += len(pending_watchlist_ids)
-            else:
-                for did in pending_watchlist_ids:
-                    storage.mark_synced(did, "watchlist_error")
+                for meta in pending_watchlist_meta:
+                    did = meta["douban_id"]
+                    item_ids = {str(v).lower().strip() for v in meta.get("ids", {}).values() if v}
+                    if item_ids and item_ids.intersection(not_found_ids):
+                        err_msg = "Not found in Simkl catalog"
+                        storage.mark_synced(did, f"error: {err_msg}")
+                        failed_rec = dict(meta)
+                        failed_rec["error"] = err_msg
+                        failed_sync_items.append(failed_rec)
+                        simkl_errors_count += 1
+                    else:
+                        storage.mark_synced(did, "synced")
+                        synced_count += 1
+            except Exception as e:
+                err_msg = str(e)
+                logger.error("Failed to push watchlist batch: %s", err_msg)
+                for meta in pending_watchlist_meta:
+                    did = meta["douban_id"]
+                    storage.mark_synced(did, f"error: {err_msg}")
+                    failed_rec = dict(meta)
+                    failed_rec["error"] = err_msg
+                    failed_sync_items.append(failed_rec)
                 simkl_errors_count += len(pending_watchlist_ids)
 
         pending_history_ids.clear()
         pending_watchlist_ids.clear()
+        pending_history_meta.clear()
+        pending_watchlist_meta.clear()
         history_movies_batch.clear()
         history_shows_batch.clear()
         watchlist_movies_batch.clear()
@@ -586,6 +630,15 @@ def run_pipeline(
                                 movie_obj["memo"] = {"text": memo_text, "is_private": False}
                             history_movies_batch.append(movie_obj)
                         pending_history_ids.append(douban_id)
+                        pending_history_meta.append({
+                            "douban_id": douban_id,
+                            "title": title,
+                            "year": item.get("year"),
+                            "type": "tv" if (is_tv or season) else "movie",
+                            "status": status,
+                            "target_status": "history (watched)",
+                            "ids": ids_dict,
+                        })
                     elif status in ("mark", "doing"):
                         simkl_to = "watching" if status == "doing" else "plantowatch"
                         if is_tv or season:
@@ -601,6 +654,15 @@ def run_pipeline(
                             }
                             watchlist_movies_batch.append(watchlist_movie)
                         pending_watchlist_ids.append(douban_id)
+                        pending_watchlist_meta.append({
+                            "douban_id": douban_id,
+                            "title": title,
+                            "year": item.get("year"),
+                            "type": "tv" if (is_tv or season) else "movie",
+                            "status": status,
+                            "target_status": simkl_to,
+                            "ids": ids_dict,
+                        })
 
                     record_sync_status = "synced"
 
@@ -639,11 +701,28 @@ def run_pipeline(
 
     # Step 5: Exporting
     console.print("\n[cyan]Exporting local archive and backup files...[/cyan]")
+    for rec in enriched_records:
+        did = rec.get("douban_id")
+        if did:
+            final_status = storage.get_sync_status(did)
+            if final_status:
+                rec["simkl_sync_status"] = final_status
+
     export_full_backup(enriched_records, "douban_full_backup.jsonl")
     if long_reviews:
         export_long_reviews(long_reviews, "long_reviews_archive.md")
     if unresolved_items:
         export_unresolved_items(unresolved_items, "unresolved_items.md")
+    if failed_sync_items:
+        export_simkl_failed_items(failed_sync_items, "simkl_failed_sync.md")
+        console.print(
+            f"[bold yellow]Exported {len(failed_sync_items)} Simkl failed items to [bold]simkl_failed_sync.md[/bold][/bold yellow]"
+        )
+    elif not dry_run and os.path.exists("simkl_failed_sync.md"):
+        try:
+            os.remove("simkl_failed_sync.md")
+        except Exception:
+            pass
 
     stats = {
         "total_scanned": total_scanned,
@@ -684,6 +763,10 @@ def run_pipeline(
     if unresolved_items:
         files_list.append(
             "- [bold yellow]unresolved_items.md[/bold yellow] (Detailed list of unresolved items with direct Douban links)"
+        )
+    if failed_sync_items:
+        files_list.append(
+            "- [bold red]simkl_failed_sync.md[/bold red] (Detailed list of items rejected by Simkl API with direct Douban links)"
         )
 
     console.print(

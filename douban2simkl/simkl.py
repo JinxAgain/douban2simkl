@@ -185,15 +185,33 @@ class SimklClient:
         shows: Optional[List[Dict[str, Any]]] = None,
         to: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Add batch items to Simkl watchlist status (POST /sync/add-to-list)."""
+        """Add batch items to Simkl watchlist status (POST /sync/add-to-list).
+
+        Simkl requires each individual item in 'movies' and 'shows' to contain the 'to' field
+        (e.g., 'plantowatch', 'watching', 'hold', 'dropped', 'completed').
+        """
         url = f"{SIMKL_API_BASE}/sync/add-to-list"
         payload: Dict[str, Any] = {}
         if to:
             payload["to"] = to
+
         if movies:
-            payload["movies"] = movies
+            formatted_movies = []
+            for m in movies:
+                m_copy = dict(m)
+                if "to" not in m_copy:
+                    m_copy["to"] = to or "plantowatch"
+                formatted_movies.append(m_copy)
+            payload["movies"] = formatted_movies
+
         if shows:
-            payload["shows"] = shows
+            formatted_shows = []
+            for s in shows:
+                s_copy = dict(s)
+                if "to" not in s_copy:
+                    s_copy["to"] = to or "plantowatch"
+                formatted_shows.append(s_copy)
+            payload["shows"] = formatted_shows
 
         resp = self._post_with_rate_limit(url, payload)
         return resp.json()

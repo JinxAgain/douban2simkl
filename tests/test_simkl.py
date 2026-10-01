@@ -92,11 +92,24 @@ def test_add_to_list_batch():
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.json.return_value = {
-        "added": {"movies": 1, "shows": 0},
+        "added": {"movies": 1, "shows": 1},
         "not_found": {"movies": [], "shows": []},
     }
 
-    with patch.object(client.session, "post", return_value=mock_resp):
+    with patch.object(client.session, "post", return_value=mock_resp) as mock_post:
         movies = [{"ids": {"imdb": "tt0111161"}}]
-        res = client.add_to_list_batch(movies=movies, to="plantowatch")
+        shows = [{"ids": {"imdb": "tt0903747"}, "to": "watching"}]
+        res = client.add_to_list_batch(movies=movies, shows=shows, to="plantowatch")
         assert res["added"]["movies"] == 1
+        assert res["added"]["shows"] == 1
+
+        # Verify posted payload structure
+        call_kwargs = mock_post.call_args[1]
+        payload = call_kwargs["json"]
+        assert payload["to"] == "plantowatch"
+        assert len(payload["movies"]) == 1
+        assert payload["movies"][0]["to"] == "plantowatch"
+        assert payload["movies"][0]["ids"]["imdb"] == "tt0111161"
+        assert len(payload["shows"]) == 1
+        assert payload["shows"][0]["to"] == "watching"
+        assert payload["shows"][0]["ids"]["imdb"] == "tt0903747"

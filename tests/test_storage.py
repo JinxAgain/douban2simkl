@@ -112,3 +112,21 @@ def test_storage_tmdb_tvdb():
         assert updated["tmdb_id"] == "117954"
         assert updated["tvdb_id"] == "396612"
 
+
+def test_storage_failed_sync_records():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "test.db")
+        storage = Storage(db_path)
+
+        storage.save_imdb_mapping(douban_id="101", imdb_id="tt00101", title="Failed Movie 1")
+        storage.save_imdb_mapping(douban_id="102", imdb_id="tt00102", title="Synced Movie 2")
+
+        storage.mark_synced("101", "error: 400 Bad Request")
+        storage.mark_synced("102", "synced")
+
+        failed = storage.get_failed_sync_records()
+        assert len(failed) == 1
+        assert failed[0]["douban_id"] == "101"
+        assert failed[0]["title"] == "Failed Movie 1"
+        assert "400 Bad Request" in failed[0]["status"]
+

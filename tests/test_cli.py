@@ -43,6 +43,7 @@ def test_cli_dry_run_pipeline(tmp_path):
     with patch("douban2simkl.cli.DoubanResolver.resolve_item", mock_resolve), \
          patch("douban2simkl.cli.DoubanResolver.batch_resolve_wikidata", return_value={}), \
          patch("douban2simkl.cli.export_full_backup", wraps=lambda records, out: len(records)), \
+         patch("douban2simkl.cli.export_simkl_failed_items", return_value=0), \
          patch("douban2simkl.cli.generate_sync_report", wraps=lambda stats, out: ""):
         run_pipeline(
             input_file=str(archive_file),
