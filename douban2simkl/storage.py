@@ -16,7 +16,7 @@ class Storage:
 
     @contextmanager
     def _get_connection(self) -> Generator[sqlite3.Connection, None, None]:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -26,6 +26,7 @@ class Storage:
     def _init_db(self) -> None:
         """Initialize database schema if tables do not exist."""
         with self._get_connection() as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS imdb_cache (

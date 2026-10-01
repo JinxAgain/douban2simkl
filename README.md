@@ -14,6 +14,10 @@ A seamless, zero-friction tool to synchronize your Douban (豆瓣) movie and TV 
   - Automatically archives all long reviews (>140 characters) into a beautifully formatted local markdown document (`long_reviews_archive.md`).
 - **TV Multi-Season Mapping**:
   - Automatically detects Season 2+ series and maps Douban episode IDs to parent Series IMDb IDs with season metadata.
+- **Multi-Source Anti-Scraping IMDb Resolution**:
+  - **Wikidata SPARQL Knowledge Graph**: Bulk-resolves ~70% of items in seconds (Douban property `P4529` to IMDb `P345`) with 0 requests to Douban.
+  - **NeoDB Open Catalog API**: Resolves missing Chinese and international entries via `https://neodb.social/api/catalog/fetch`.
+  - **Douban Scraper Fallback**: Only accessed as a last resort for items unavailable in Wikidata and NeoDB, virtually eliminating rate limits and IP bans.
 - **Smart Deduplication & Caching**:
   - Fetches your existing Simkl library to prevent duplicate imports.
   - Persists resolved IMDb mappings and sync states in a local SQLite database (`douban2simkl.db`) for instant restarts and incremental updates.

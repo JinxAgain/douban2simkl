@@ -1,11 +1,14 @@
 """Interactive CLI Wizard and orchestrator for douban2simkl."""
 
 import argparse
+import concurrent.futures
+import json
 import logging
 import os
+import random
 import sys
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from rich.console import Console
 from rich.panel import Panel
@@ -160,13 +163,22 @@ def run_pipeline(
     batch_size: int = 50,
     skip_auth: bool = False,
     force_crawl: bool = False,
+    threads: int = 3,
 ) -> None:
     """Execute the end-to-end sync and export pipeline."""
     print_banner()
 
+    # Pre-load Douban session if available to share cookies with resolver
+    douban_session = None
+    try:
+        temp_client = get_douban_client(cookie_string=config.DOUBAN_COOKIE)
+        douban_session = temp_client.session
+    except Exception:
+        pass
+
     storage = Storage(db_path)
     simkl_client = SimklClient(client_id=config.SIMKL_CLIENT_ID)
-    resolver = DoubanResolver(storage=storage)
+    resolver = DoubanResolver(storage=storage, session=douban_session)
 
     # Step 1: Obtain Douban records
     douban_records: List[Dict[str, Any]] = []
@@ -174,10 +186,8 @@ def run_pipeline(
     if input_file:
         archive_path = input_file
     elif not force_crawl:
-        for candidate in ["douban_archive.jsonl", "douban_archive.jsonl.backup"]:
-            if os.path.exists(candidate):
-                archive_path = candidate
-                break
+        if os.path.exists("douban_archive.jsonl"):
+            archive_path = "douban_archive.jsonl"
 
     if archive_path:
         if not os.path.exists(archive_path):
@@ -222,8 +232,15 @@ def run_pipeline(
                     )
 
                 douban_records = douban_client.fetch_all_movie_interests(
-                    on_init=on_init, on_progress=on_progress
+                    limit=limit, on_init=on_init, on_progress=on_progress
                 )
+                try:
+                    with open("douban_archive.jsonl", "w", encoding="utf-8") as f:
+                        for rec in douban_records:
+                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    console.print(f"[bold green]Saved {len(douban_records)} raw records to douban_archive.jsonl[/bold green]\n")
+                except Exception as e:
+                    logger.warning("Failed to save douban_archive.jsonl: %s", e)
         except Exception as e:
             console.print(f"[yellow]Could not automatically fetch Douban records: {e}[/yellow]")
             prompt_path = console.input("[bold yellow]Please enter path to a Douban JSONL archive file: [/bold yellow]").strip()
@@ -312,6 +329,60 @@ def run_pipeline(
         history_shows_batch.clear()
         watchlist_items_batch.clear()
 
+    # Bulk Wikidata Pre-fetch: query Wikidata SPARQL in batches of 100 for all uncached items
+    uncached_ids = [
+        str(r.get("douban_id"))
+        for r in douban_records
+        if not storage.get_imdb_mapping(str(r.get("douban_id")))
+    ]
+    if uncached_ids:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as wiki_progress:
+            wiki_task = wiki_progress.add_task("[cyan]Pre-fetching from Wikidata Knowledge Graph...", total=len(uncached_ids))
+
+            def on_wiki_progress(completed: int, total: int, matches: int) -> None:
+                wiki_progress.update(
+                    wiki_task,
+                    completed=completed,
+                    total=total,
+                    description=f"[cyan]Wikidata Knowledge Graph (matched {matches} items)...",
+                )
+
+            wiki_results = resolver.batch_resolve_wikidata(uncached_ids, on_progress=on_wiki_progress)
+            console.print(
+                f"[bold green]✓ Pre-resolved {len(wiki_results)} items via Wikidata (zero Douban requests)![/bold green]\n"
+            )
+
+    workers = min(max(1, threads), 5)
+    console.print(
+        f"[cyan]Resolving & syncing with [bold]{workers}[/bold] concurrent workers (NeoDB -> Douban Fallback)...[/cyan]\n"
+    )
+
+    def resolve_single_record(record: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        douban_id = str(record.get("douban_id", ""))
+        title = record.get("title", "")
+        raw_type = record.get("type", "movie")
+        is_tv = raw_type == "tv"
+        cached = storage.get_imdb_mapping(douban_id)
+        if not cached:
+            # Small random delay between 0.1s and 0.25s for NeoDB / external APIs
+            time.sleep(random.uniform(0.1, 0.25))
+        resolved = resolver.resolve_item(
+            douban_id=douban_id,
+            title=title,
+            is_tv=is_tv,
+            tmdb_api_key=config.TMDB_API_KEY,
+            omdb_api_key=config.OMDB_API_KEY,
+        )
+        return record, resolved
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -323,111 +394,104 @@ def run_pipeline(
     ) as progress:
         sync_task = progress.add_task("[cyan]Processing & Syncing...", total=len(douban_records))
 
-        for item in douban_records:
-            douban_id = str(item.get("douban_id", ""))
-            title = item.get("title", "")
-            raw_type = item.get("type", "movie")
-            is_tv = raw_type == "tv"
-            status = item.get("status", "done")  # done, mark, doing
-            create_time = item.get("create_time", "")
-            official_rating = item.get("rating")
-            comment = item.get("comment", "") or ""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            for item, resolved in executor.map(resolve_single_record, douban_records):
+                douban_id = str(item.get("douban_id", ""))
+                title = item.get("title", "")
+                raw_type = item.get("type", "movie")
+                is_tv = raw_type == "tv"
+                status = item.get("status", "done")  # done, mark, doing
+                create_time = item.get("create_time", "")
+                official_rating = item.get("official_rating") or item.get("rating")
+                comment = item.get("comment", "") or ""
 
-            # Check if this item is already marked as synced in local DB
-            cached_sync_status = storage.get_sync_status(douban_id)
+                # Check if this item is already marked as synced in local DB
+                cached_sync_status = storage.get_sync_status(douban_id)
 
-            # Resolve IMDb ID
-            resolved = resolver.resolve_item(
-                douban_id=douban_id,
-                title=title,
-                is_tv=is_tv,
-                tmdb_api_key=config.TMDB_API_KEY,
-                omdb_api_key=config.OMDB_API_KEY,
-            )
-            imdb_id = resolved.get("imdb_id")
-            series_imdb_id = resolved.get("series_imdb_id")
-            season = resolved.get("season")
+                imdb_id = resolved.get("imdb_id")
+                series_imdb_id = resolved.get("series_imdb_id")
+                season = resolved.get("season")
 
-            # Calibrate rating & comment
-            calibrated_rating, rating_source = calibrate_rating(official_rating, comment)
-            memo_text, is_long = normalize_comment(comment)
+                # Calibrate rating & comment
+                calibrated_rating, rating_source = calibrate_rating(official_rating, comment)
+                memo_text, is_long = normalize_comment(comment)
 
-            record_sync_status = "pending"
+                record_sync_status = "pending"
 
-            # Check deduplication against Simkl library
-            target_id = series_imdb_id or imdb_id
-            if (target_id and target_id in simkl_existing_ids) or cached_sync_status == "synced":
-                already_in_simkl_count += 1
-                record_sync_status = "already_synced"
-            elif not imdb_id:
-                failed_count += 1
-                record_sync_status = "unresolved_no_imdb"
-            else:
-                new_to_sync_count += 1
-                # Prepare payload
-                if status == "done":
-                    if is_tv or season:
-                        show_obj: Dict[str, Any] = {
+                # Check deduplication against Simkl library
+                target_id = series_imdb_id or imdb_id
+                if (target_id and target_id in simkl_existing_ids) or cached_sync_status == "synced":
+                    already_in_simkl_count += 1
+                    record_sync_status = "already_synced"
+                elif not imdb_id:
+                    failed_count += 1
+                    record_sync_status = "unresolved_no_imdb"
+                else:
+                    new_to_sync_count += 1
+                    # Prepare payload
+                    if status == "done":
+                        if is_tv or season:
+                            show_obj: Dict[str, Any] = {
+                                "ids": {"imdb": series_imdb_id or imdb_id},
+                                "seasons": [{"number": season or 1}],
+                            }
+                            if calibrated_rating:
+                                show_obj["rating"] = calibrated_rating
+                            if create_time:
+                                show_obj["watched_at"] = create_time
+                            if memo_text:
+                                show_obj["memo"] = {"text": memo_text, "is_private": False}
+                            history_shows_batch.append(show_obj)
+                        else:
+                            movie_obj: Dict[str, Any] = {
+                                "ids": {"imdb": imdb_id},
+                            }
+                            if calibrated_rating:
+                                movie_obj["rating"] = calibrated_rating
+                            if create_time:
+                                movie_obj["watched_at"] = create_time
+                            if memo_text:
+                                movie_obj["memo"] = {"text": memo_text, "is_private": False}
+                            history_movies_batch.append(movie_obj)
+                        pending_sync_ids.append(douban_id)
+                    elif status in ("mark", "doing"):
+                        simkl_to = "watching" if status == "doing" else "plantowatch"
+                        watchlist_obj = {
                             "ids": {"imdb": series_imdb_id or imdb_id},
-                            "seasons": [{"number": season or 1}],
+                            "to": simkl_to,
                         }
-                        if calibrated_rating:
-                            show_obj["rating"] = calibrated_rating
-                        if create_time:
-                            show_obj["watched_at"] = create_time
-                        if memo_text:
-                            show_obj["memo"] = {"text": memo_text, "is_private": False}
-                        history_shows_batch.append(show_obj)
-                    else:
-                        movie_obj: Dict[str, Any] = {
-                            "ids": {"imdb": imdb_id},
-                        }
-                        if calibrated_rating:
-                            movie_obj["rating"] = calibrated_rating
-                        if create_time:
-                            movie_obj["watched_at"] = create_time
-                        if memo_text:
-                            movie_obj["memo"] = {"text": memo_text, "is_private": False}
-                        history_movies_batch.append(movie_obj)
-                    pending_sync_ids.append(douban_id)
-                elif status in ("mark", "doing"):
-                    simkl_to = "watching" if status == "doing" else "plantowatch"
-                    watchlist_obj = {
-                        "ids": {"imdb": series_imdb_id or imdb_id},
-                        "to": simkl_to,
-                    }
-                    watchlist_items_batch.append(watchlist_obj)
-                    pending_sync_ids.append(douban_id)
+                        watchlist_items_batch.append(watchlist_obj)
+                        pending_sync_ids.append(douban_id)
 
-                record_sync_status = "synced"
+                    record_sync_status = "synced"
 
-                if len(pending_sync_ids) >= batch_size:
-                    flush_batches()
+                    if len(pending_sync_ids) >= batch_size:
+                        flush_batches()
 
-            enriched_entry = {
-                "douban_id": douban_id,
-                "title": title,
-                "original_title": item.get("original_title", ""),
-                "year": item.get("year"),
-                "type": "tv" if (is_tv or season) else "movie",
-                "status": status,
-                "create_time": create_time,
-                "official_rating": official_rating,
-                "calibrated_rating": calibrated_rating,
-                "rating_source": rating_source,
-                "imdb_id": imdb_id,
-                "series_imdb_id": series_imdb_id,
-                "season": season,
-                "comment": comment,
-                "memo_synced": memo_text,
-                "simkl_sync_status": record_sync_status,
-            }
-            enriched_records.append(enriched_entry)
+                enriched_entry = {
+                    "douban_id": douban_id,
+                    "title": title,
+                    "original_title": item.get("original_title", ""),
+                    "year": item.get("year"),
+                    "type": "tv" if (is_tv or season) else "movie",
+                    "status": status,
+                    "create_time": create_time,
+                    "official_rating": official_rating,
+                    "calibrated_rating": calibrated_rating,
+                    "rating_source": rating_source,
+                    "imdb_id": imdb_id,
+                    "series_imdb_id": series_imdb_id,
+                    "season": season,
+                    "comment": comment,
+                    "memo_synced": memo_text,
+                    "simkl_sync_status": record_sync_status,
+                }
+                enriched_records.append(enriched_entry)
 
-            if is_long:
-                long_reviews.append(enriched_entry)
+                if is_long:
+                    long_reviews.append(enriched_entry)
 
-            progress.advance(sync_task)
+                progress.advance(sync_task)
 
         # Flush any remaining items
         flush_batches()
@@ -481,6 +545,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=50, help="Batch size for Simkl sync calls")
     parser.add_argument("--skip-auth", action="store_true", help="Skip Simkl authorization and only export local backups")
     parser.add_argument("--crawl", action="store_true", help="Force online crawling from Douban even if local archive file exists")
+    parser.add_argument("--threads", type=int, default=3, help="Concurrent workers for resolving IMDb IDs (default: 3, max: 5)")
 
     args = parser.parse_args()
     run_pipeline(
@@ -491,6 +556,7 @@ def main() -> None:
         batch_size=args.batch_size,
         skip_auth=args.skip_auth,
         force_crawl=args.crawl,
+        threads=args.threads,
     )
 
 

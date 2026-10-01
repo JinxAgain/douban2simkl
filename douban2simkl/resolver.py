@@ -1,9 +1,11 @@
-"""Douban ID to IMDb ID and TV multi-season Series ID resolver."""
-
+import logging
 import re
+import time
+from typing import Any, Dict, Optional
 import requests
-from typing import Optional, Dict, Any
 from douban2simkl.storage import Storage
+
+logger = logging.getLogger(__name__)
 
 CHINESE_NUMS = {
     "一": 1,
@@ -38,11 +40,26 @@ DOUBAN_DESKTOP_URL = "https://movie.douban.com/subject/{}/"
 IMDB_DESC_PATTERN = re.compile(r"<td>IMDb</td>\s*<td>(tt\d+)</td>")
 IMDB_DESKTOP_PATTERN = re.compile(r"IMDb:.*?(\btt\d+\b)")
 
+WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
+WIKIDATA_HEADERS = {
+    "User-Agent": "douban2simkl/1.0 (https://github.com/douban2simkl)",
+    "Accept": "application/json",
+}
+
+NEODB_FETCH_URL = "https://neodb.social/api/catalog/fetch"
+NEODB_HEADERS = {
+    "User-Agent": "douban2simkl/1.0 (https://github.com/douban2simkl)",
+    "Accept": "application/json",
+}
+NEODB_IMDB_PATTERN = re.compile(r"imdb\.com/title/(tt\d+)")
+
 COMMON_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
         "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Referer": "https://m.douban.com/movie",
 }
 
@@ -79,29 +96,125 @@ class ItemResolver:
         self.storage = storage
         self.session = session or requests.Session()
 
-    def fetch_douban_imdb_id(self, douban_id: str) -> Optional[str]:
-        """Fetch IMDb ID directly from Douban pages."""
-        # 1. Try mobile description page
+    def batch_resolve_wikidata(
+        self,
+        douban_ids: Any,
+        chunk_size: int = 100,
+        on_progress: Optional[Any] = None,
+    ) -> Dict[str, str]:
+        """Batch resolve Douban IDs to IMDb IDs using Wikidata SPARQL Knowledge Graph."""
+        resolved_map: Dict[str, str] = {}
+        valid_ids = [str(did).strip() for did in douban_ids if str(did).strip().isdigit()]
+        if not valid_ids:
+            return resolved_map
+
+        for i in range(0, len(valid_ids), chunk_size):
+            chunk = valid_ids[i : i + chunk_size]
+            values_str = " ".join(f'"{did}"' for did in chunk)
+            query = f"""
+            SELECT ?douban ?imdb WHERE {{
+              VALUES ?douban {{ {values_str} }}
+              ?item wdt:P4529 ?douban .
+              ?item wdt:P345 ?imdb .
+            }}
+            """
+            try:
+                resp = requests.post(
+                    WIKIDATA_SPARQL_URL,
+                    data={"query": query, "format": "json"},
+                    headers=WIKIDATA_HEADERS,
+                    timeout=25,
+                )
+                if resp.status_code == 200:
+                    bindings = resp.json().get("results", {}).get("bindings", [])
+                    for b in bindings:
+                        did = b.get("douban", {}).get("value")
+                        imdb = b.get("imdb", {}).get("value")
+                        if did and imdb and imdb.startswith("tt"):
+                            resolved_map[did] = imdb
+                            if self.storage:
+                                self.storage.save_imdb_mapping(douban_id=did, imdb_id=imdb)
+                else:
+                    logger.warning("Wikidata SPARQL returned HTTP %d", resp.status_code)
+            except Exception as e:
+                logger.warning("Wikidata SPARQL query failed: %s", e)
+
+            if on_progress:
+                try:
+                    on_progress(min(i + chunk_size, len(valid_ids)), len(valid_ids), len(resolved_map))
+                except Exception:
+                    pass
+
+            time.sleep(0.2)
+
+        return resolved_map
+
+    def fetch_neodb_imdb_id(self, douban_id: str, timeout: int = 8) -> Optional[str]:
+        """Fetch IMDb ID from NeoDB public catalog API."""
+        douban_url = f"https://movie.douban.com/subject/{douban_id}/"
         try:
-            url = DOUBAN_DESC_URL.format(douban_id)
-            resp = self.session.get(url, headers=COMMON_HEADERS, timeout=12)
+            resp = self.session.get(
+                NEODB_FETCH_URL,
+                params={"url": douban_url},
+                headers=NEODB_HEADERS,
+                allow_redirects=True,
+                timeout=timeout,
+            )
             if resp.status_code == 200:
-                match = IMDB_DESC_PATTERN.search(resp.text)
-                if match:
-                    return match.group(1)
-        except Exception:
-            pass
+                data = resp.json()
+                imdb = data.get("imdb")
+                if imdb and isinstance(imdb, str) and imdb.startswith("tt"):
+                    return imdb.strip()
+                for ext in data.get("external_resources", []):
+                    u = ext.get("url", "")
+                    m = NEODB_IMDB_PATTERN.search(u)
+                    if m:
+                        return m.group(1)
+            elif resp.status_code == 429:
+                logger.warning("NeoDB rate limit reached (HTTP 429).")
+        except Exception as e:
+            logger.debug("NeoDB request failed for %s: %s", douban_id, e)
+        return None
+
+    def fetch_douban_imdb_id(self, douban_id: str, max_retries: int = 2) -> Optional[str]:
+        """Fetch IMDb ID directly from Douban pages with rate limit backoff."""
+        # 1. Try mobile description page
+        for attempt in range(max_retries + 1):
+            try:
+                url = DOUBAN_DESC_URL.format(douban_id)
+                resp = self.session.get(url, headers=COMMON_HEADERS, timeout=12)
+                if resp.status_code == 200:
+                    match = IMDB_DESC_PATTERN.search(resp.text)
+                    if match:
+                        return match.group(1)
+                    break
+                elif resp.status_code in (403, 429):
+                    wait_time = 3 * (attempt + 1)
+                    logger.warning("Douban rate limited (HTTP %d). Backing off for %ds...", resp.status_code, wait_time)
+                    time.sleep(wait_time)
+                    continue
+            except Exception as e:
+                logger.debug("Error fetching desc page for %s: %s", douban_id, e)
+                break
 
         # 2. Fallback to desktop subject page
-        try:
-            url = DOUBAN_DESKTOP_URL.format(douban_id)
-            resp = self.session.get(url, headers=COMMON_HEADERS, timeout=12)
-            if resp.status_code == 200:
-                match = IMDB_DESKTOP_PATTERN.search(resp.text)
-                if match:
-                    return match.group(1)
-        except Exception:
-            pass
+        for attempt in range(max_retries + 1):
+            try:
+                url = DOUBAN_DESKTOP_URL.format(douban_id)
+                resp = self.session.get(url, headers=COMMON_HEADERS, timeout=12)
+                if resp.status_code == 200:
+                    match = IMDB_DESKTOP_PATTERN.search(resp.text)
+                    if match:
+                        return match.group(1)
+                    break
+                elif resp.status_code in (403, 429):
+                    wait_time = 3 * (attempt + 1)
+                    logger.warning("Douban rate limited (HTTP %d). Backing off for %ds...", resp.status_code, wait_time)
+                    time.sleep(wait_time)
+                    continue
+            except Exception as e:
+                logger.debug("Error fetching subject page for %s: %s", douban_id, e)
+                break
 
         return None
 
@@ -159,26 +272,64 @@ class ItemResolver:
         tmdb_api_key: Optional[str] = None,
         omdb_api_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Resolve a Douban item, utilizing local SQLite cache when available."""
-        # Check cache
+        """Resolve a Douban item, prioritizing Wikidata and NeoDB before falling back to Douban."""
+        douban_id = str(douban_id)
+        season = extract_season_number(title)
+
+        # 1. Check local SQLite cache first (including Wikidata bulk pre-fetched items)
         if self.storage:
             cached = self.storage.get_imdb_mapping(douban_id)
             if cached and cached.get("imdb_id"):
-                return cached
+                imdb_id = cached["imdb_id"]
+                cached_season = cached.get("season") if cached.get("season") is not None else season
+                series_imdb_id = cached.get("series_imdb_id")
+                if cached_season and cached_season > 1 and not series_imdb_id:
+                    series_imdb_id = self.resolve_series_imdb_id(
+                        imdb_id, tmdb_api_key=tmdb_api_key, omdb_api_key=omdb_api_key
+                    )
+                    self.storage.save_imdb_mapping(
+                        douban_id=douban_id,
+                        imdb_id=imdb_id,
+                        series_imdb_id=series_imdb_id,
+                        season=cached_season,
+                        title=title,
+                    )
+                return {
+                    "douban_id": douban_id,
+                    "imdb_id": imdb_id,
+                    "series_imdb_id": series_imdb_id,
+                    "season": cached_season,
+                    "title": title or cached.get("title"),
+                }
 
-        season = extract_season_number(title)
-        imdb_id = self.fetch_douban_imdb_id(douban_id)
+        imdb_id = None
+
+        # 2. Query NeoDB public catalog
+        try:
+            imdb_id = self.fetch_neodb_imdb_id(douban_id)
+            if imdb_id:
+                logger.debug("Resolved %s (%s) via NeoDB: %s", douban_id, title, imdb_id)
+        except Exception as e:
+            logger.debug("NeoDB resolution failed for %s: %s", douban_id, e)
+
+        # 3. Final Fallback: Douban scraping only if neither Wikidata nor NeoDB has it
+        if not imdb_id:
+            try:
+                imdb_id = self.fetch_douban_imdb_id(douban_id)
+                if imdb_id:
+                    logger.debug("Resolved %s (%s) via Douban fallback: %s", douban_id, title, imdb_id)
+            except Exception as e:
+                logger.debug("Douban fallback resolution failed for %s: %s", douban_id, e)
+
         series_imdb_id = None
-
         if imdb_id and (is_tv or season is not None):
-            # If Season > 1 or TV show, resolve parent series IMDb ID
             if season and season > 1:
                 series_imdb_id = self.resolve_series_imdb_id(
                     imdb_id, tmdb_api_key=tmdb_api_key, omdb_api_key=omdb_api_key
                 )
 
         result = {
-            "douban_id": str(douban_id),
+            "douban_id": douban_id,
             "imdb_id": imdb_id,
             "series_imdb_id": series_imdb_id,
             "season": season,

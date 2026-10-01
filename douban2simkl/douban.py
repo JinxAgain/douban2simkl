@@ -111,6 +111,7 @@ class DoubanClient:
 
     def fetch_all_movie_interests(
         self,
+        limit: Optional[int] = None,
         on_init: Optional[Callable[[Dict[str, int], int], None]] = None,
         on_progress: Optional[Callable[..., None]] = None,
     ) -> List[Dict[str, Any]]:
@@ -128,15 +129,21 @@ class DoubanClient:
                 status_totals[st] = 0
 
         grand_total = sum(status_totals.values())
+        if limit and limit > 0:
+            grand_total = min(grand_total, limit)
         if on_init:
             on_init(status_totals, grand_total)
 
         for status in statuses:
+            if limit and len(all_items) >= limit:
+                break
             start = 0
             total_in_status = status_totals.get(status, 0)
             page_count = math.ceil(total_in_status / PAGE_SIZE) if total_in_status else 1
             status_count = 0
             while start < page_count * PAGE_SIZE:
+                if limit and len(all_items) >= limit:
+                    break
                 url = URL_INTERESTS.format(
                     uid=uid, type="movie", status=status, start=start, count=PAGE_SIZE, ck=self.ck
                 )
@@ -151,6 +158,8 @@ class DoubanClient:
                     if not interests:
                         break
                     for item in interests:
+                        if limit and len(all_items) >= limit:
+                            break
                         subject = item.get("subject", {})
                         douban_id = str(subject.get("id", ""))
                         if not douban_id:
