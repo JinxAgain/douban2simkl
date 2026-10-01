@@ -33,7 +33,20 @@ class SimklClient:
         self._update_headers()
 
     def request_pin(self) -> Dict[str, Any]:
-        """Request a device PIN code for authorization."""
+        """Request a device PIN code for authorization (supports OAuth2 device flow & legacy PIN)."""
+        # 1. Try modern OAuth2 Device Authorization (Simkl AUTH V2)
+        try:
+            url = f"{SIMKL_API_BASE}/oauth2/device"
+            resp = self.session.post(url, json={"client_id": self.client_id}, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                self._device_code = data.get("device_code")
+                data["verification_url"] = data.get("verification_uri_complete") or data.get("verification_uri", "https://simkl.com/pin")
+                return data
+        except Exception as e:
+            logger.debug("OAuth2 device request failed: %s", e)
+
+        # 2. Fallback to legacy GET /oauth/pin
         url = f"{SIMKL_API_BASE}/oauth/pin"
         params = {"client_id": self.client_id}
         resp = self.session.get(url, params=params, timeout=15)
@@ -42,6 +55,24 @@ class SimklClient:
 
     def poll_pin(self, user_code: str) -> Optional[str]:
         """Poll to check if the user has authorized the PIN code on simkl.com/pin."""
+        # 1. Modern OAuth2 Device polling
+        if hasattr(self, "_device_code") and self._device_code:
+            url = f"{SIMKL_API_BASE}/oauth2/token"
+            payload = {
+                "client_id": self.client_id,
+                "device_code": self._device_code,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            }
+            resp = self.session.post(url, json=payload, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                token = data.get("access_token")
+                if token:
+                    self.set_access_token(token)
+                    return token
+            return None
+
+        # 2. Fallback to legacy GET /oauth/pin/{user_code}
         url = f"{SIMKL_API_BASE}/oauth/pin/{user_code}"
         params = {"client_id": self.client_id}
         resp = self.session.get(url, params=params, timeout=15)
