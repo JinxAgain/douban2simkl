@@ -90,14 +90,41 @@ class DoubanClient:
 
     def checkin(self) -> Dict[str, str]:
         """Verify login status and return Douban user profile info."""
-        resp = self.session.get(URL_MINE, headers={"User-Agent": MOBILE_UA}, allow_redirects=True, timeout=30)
-        soup = BeautifulSoup(resp.text, "lxml")
-        user_el = soup.select_one("#user")
-        if user_el is None or not user_el.get("value"):
-            raise RuntimeError("Douban login expired or not logged in. Please log in to douban.com in your browser.")
-        uid = str(user_el.get("value"))
-        username = str(user_el.get("data-name") or "")
-        return {"uid": uid, "username": username}
+        # 1. Try extracting UID directly from dbcl2 cookie and verifying via Rexxar user API
+        uid = None
+        for c in self.session.cookies:
+            if c.name == "dbcl2" and c.value:
+                val = c.value.strip("\"' ")
+                if ":" in val:
+                    uid = val.split(":")[0]
+                elif val.isdigit():
+                    uid = val
+                break
+
+        if uid:
+            try:
+                url = f"https://m.douban.com/rexxar/api/v2/user/{uid}?ck={self.ck}&for_mobile=1"
+                resp = self.request("GET", url, referer="https://m.douban.com/")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    username = data.get("name") or data.get("id") or uid
+                    return {"uid": str(uid), "username": str(username)}
+            except Exception as e:
+                logger.debug("Rexxar user profile check failed: %s", e)
+
+        # 2. Fallback to HTML parsing of URL_MINE
+        try:
+            resp = self.session.get(URL_MINE, headers={"User-Agent": MOBILE_UA}, allow_redirects=True, timeout=30)
+            soup = BeautifulSoup(resp.text, "lxml")
+            user_el = soup.select_one("#user")
+            if user_el is not None and user_el.get("value"):
+                uid = str(user_el.get("value"))
+                username = str(user_el.get("data-name") or "")
+                return {"uid": uid, "username": username}
+        except Exception as e:
+            logger.debug("URL_MINE check failed: %s", e)
+
+        raise RuntimeError("Douban login expired or not logged in. Please log in to douban.com in your browser.")
 
     def get_interests_count(self, uid: str, status: str) -> int:
         """Fetch total count of interests for a status."""
@@ -217,14 +244,15 @@ def get_douban_client(
     if browser:
         loader = getattr(browser_cookie3, browser.lower(), None)
         if loader:
-            loaders.append(loader)
+            loaders.append((browser.lower(), loader))
     else:
-        for name in ["chrome", "edge", "firefox", "brave", "opera", "safari", "chromium"]:
+        for name in ["firefox", "chrome", "edge", "brave", "opera", "safari", "chromium"]:
             loader = getattr(browser_cookie3, name, None)
             if loader:
-                loaders.append(loader)
+                loaders.append((name, loader))
 
-    for loader in loaders:
+    loader_errors = []
+    for b_name, loader in loaders:
         try:
             cj = loader(domain_name="douban.com")
             if len(cj) > 0:
@@ -232,13 +260,17 @@ def get_douban_client(
                 # Verify checkin works
                 client.checkin()
                 return client
-        except Exception:
+            else:
+                loader_errors.append(f"{b_name}: no cookies found for douban.com")
+        except Exception as e:
+            loader_errors.append(f"{b_name}: {e}")
             continue
 
+    err_summary = "; ".join(loader_errors) if loader_errors else "no supported browsers found"
     raise RuntimeError(
-        "Could not automatically read Douban cookies from local browsers. "
-        "Please ensure you are logged into douban.com in Chrome or Edge, "
-        "or provide cookies via DOUBAN_COOKIE."
+        f"Could not automatically read Douban cookies from local browsers ({err_summary}). "
+        "Please ensure you are logged into douban.com in Firefox, Chrome, or Edge, "
+        "or provide cookies manually via DOUBAN_COOKIE in your .env file."
     )
 
 

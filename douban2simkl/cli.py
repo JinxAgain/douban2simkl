@@ -177,6 +177,7 @@ def run_pipeline(
     skip_auth: bool = False,
     force_crawl: bool = False,
     threads: int = 3,
+    browser: Optional[str] = None,
 ) -> None:
     """Execute the end-to-end sync and export pipeline."""
     print_banner()
@@ -184,7 +185,7 @@ def run_pipeline(
     # Pre-load Douban session if available to share cookies with resolver
     douban_session = None
     try:
-        temp_client = get_douban_client(cookie_string=config.DOUBAN_COOKIE)
+        temp_client = get_douban_client(cookie_string=config.DOUBAN_COOKIE, browser=browser)
         douban_session = temp_client.session
     except Exception:
         pass
@@ -211,7 +212,7 @@ def run_pipeline(
     else:
         console.print("[cyan]Detecting Douban cookies from local browsers...[/cyan]")
         try:
-            douban_client = get_douban_client(cookie_string=config.DOUBAN_COOKIE)
+            douban_client = get_douban_client(cookie_string=config.DOUBAN_COOKIE, browser=browser)
             user_info = douban_client.checkin()
             console.print(
                 f"[green]Logged in to Douban as: [bold]{user_info.get('username')}[/bold] (UID: {user_info.get('uid')})[/green]"
@@ -787,6 +788,7 @@ def main() -> None:
     parser.add_argument("--skip-auth", action="store_true", help="Skip Simkl authorization and only export local backups")
     parser.add_argument("--crawl", action="store_true", help="Force online crawling from Douban even if local archive file exists")
     parser.add_argument("--threads", type=int, default=3, help="Concurrent workers for resolving IMDb IDs (default: 3, max: 5)")
+    parser.add_argument("--browser", help="Browser to extract Douban cookies from (e.g. firefox, chrome, edge)")
 
     args = parser.parse_args()
     run_pipeline(
@@ -798,6 +800,7 @@ def main() -> None:
         skip_auth=args.skip_auth,
         force_crawl=args.crawl,
         threads=args.threads,
+        browser=args.browser,
     )
 
 
