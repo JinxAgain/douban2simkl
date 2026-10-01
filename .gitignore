@@ -19,5 +19,5 @@ long_reviews_archive.md
 sync_report*.md
 
 # Cloned reference projects (if submodule/vendored)
-# douban-idatabase/
-# douban-backup/
+douban-idatabase/
+douban-backup/
