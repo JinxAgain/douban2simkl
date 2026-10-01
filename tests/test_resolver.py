@@ -102,7 +102,7 @@ def test_batch_resolve_wikidata_mocked():
             }
         }
 
-        with patch("requests.post", return_value=mock_resp):
+        with patch.object(resolver.session, "post", return_value=mock_resp):
             res = resolver.batch_resolve_wikidata(["1292052", "1291546"])
             assert res["1292052"] == "tt0111161"
             assert res["1291546"] == "tt0106332"
@@ -175,7 +175,12 @@ def test_search_tmdb_title_fallback():
     search_resp = MagicMock()
     search_resp.status_code = 200
     search_resp.json.return_value = {
-        "results": [{"id": 550, "title": "Fight Club"}]
+        "results": [{
+            "id": 550,
+            "title": "搏击俱乐部",
+            "original_title": "Fight Club",
+            "release_date": "1999-10-15",
+        }]
     }
 
     ext_resp = MagicMock()
@@ -188,12 +193,34 @@ def test_search_tmdb_title_fallback():
         assert res["imdb_id"] == "tt0137523"
 
 
+def test_search_tmdb_title_rejects_unrelated_fuzzy_match():
+    resolver = ItemResolver(storage=None)
+
+    # TMDb returns an unrelated movie that matched fuzzy keywords
+    search_resp = MagicMock()
+    search_resp.status_code = 200
+    search_resp.json.return_value = {
+        "results": [{
+            "id": 9999,
+            "title": "完全无关的其他电影",
+            "original_title": "Completely Unrelated",
+            "release_date": "2015-05-01",
+        }]
+    }
+
+    with patch.object(resolver.session, "get", return_value=search_resp):
+        res = resolver.search_tmdb_title("小众国产纪录片", year=2021, tmdb_api_key="fake_key")
+        # Must be rejected because title and year do not strictly match
+        assert res["tmdb_id"] is None
+        assert res["imdb_id"] is None
+
+
 def test_search_omdb_title_fallback():
     resolver = ItemResolver(storage=None)
 
     search_resp = MagicMock()
     search_resp.status_code = 200
-    search_resp.json.return_value = {"imdbID": "tt0137523", "Response": "True"}
+    search_resp.json.return_value = {"Title": "Fight Club", "Year": "1999", "imdbID": "tt0137523", "Response": "True"}
 
     with patch.object(resolver.session, "get", return_value=search_resp):
         imdb_id = resolver.search_omdb_title("Fight Club", year=1999, omdb_api_key="fake_key")

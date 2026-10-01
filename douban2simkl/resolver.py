@@ -105,6 +105,40 @@ def extract_season_number(title: str) -> Optional[int]:
     return None
 
 
+def is_strict_tmdb_match(candidate: Dict[str, Any], query_title: str, expected_year: Optional[Any]) -> bool:
+    """Strictly validate whether a TMDb search result exactly matches the title and year."""
+    if not candidate or not query_title:
+        return False
+
+    cand_title = (candidate.get("title") or candidate.get("name") or "").strip().lower()
+    cand_orig_title = (candidate.get("original_title") or candidate.get("original_name") or "").strip().lower()
+    clean_query = query_title.strip().lower()
+
+    # Normalize punctuation and whitespace for both Chinese and English titles
+    norm_query = re.sub(r"[^\w\u4e00-\u9fa5]", "", clean_query)
+    norm_title = re.sub(r"[^\w\u4e00-\u9fa5]", "", cand_title)
+    norm_orig = re.sub(r"[^\w\u4e00-\u9fa5]", "", cand_orig_title)
+
+    # Title must exactly match either the localized title or original title
+    if norm_query != norm_title and norm_query != norm_orig:
+        return False
+
+    # Year must match within +-1 year if year is known
+    if expected_year:
+        try:
+            exp_y = int(str(expected_year).strip()[:4])
+            release_date = candidate.get("release_date") or candidate.get("first_air_date") or ""
+            cand_year_str = release_date[:4]
+            if cand_year_str.isdigit():
+                cand_y = int(cand_year_str)
+                if abs(cand_y - exp_y) > 1:
+                    return False
+        except (ValueError, TypeError):
+            pass
+
+    return True
+
+
 class ItemResolver:
     """Resolves Douban ID to IMDb, TMDb, and TVDB IDs, and handles TV multi-season series mapping."""
 
@@ -461,8 +495,14 @@ class ItemResolver:
             resp = self.session.get(url, params=params, timeout=10)
             if resp.status_code == 200:
                 results = resp.json().get("results", [])
-                if results and "id" in results[0]:
-                    media_id = results[0]["id"]
+                matched_cand = None
+                for cand in results:
+                    if is_strict_tmdb_match(cand, clean_title or title, year):
+                        matched_cand = cand
+                        break
+
+                if matched_cand and "id" in matched_cand:
+                    media_id = matched_cand["id"]
                     result["tmdb_id"] = str(media_id)
                     ext_url = f"https://api.themoviedb.org/3/{endpoint}/{media_id}/external_ids?api_key={tmdb_api_key}"
                     ext_resp = self.session.get(ext_url, timeout=10)
@@ -472,6 +512,12 @@ class ItemResolver:
                             result["imdb_id"] = ext_data["imdb_id"]
                         if ext_data.get("tvdb_id"):
                             result["tvdb_id"] = str(ext_data["tvdb_id"])
+                else:
+                    logger.debug(
+                        "TMDb search for '%s' (%s) rejected: no candidate strictly matched title & year.",
+                        title,
+                        year,
+                    )
         except Exception as e:
             logger.debug("TMDb search failed for '%s': %s", title, e)
 
@@ -483,7 +529,7 @@ class ItemResolver:
         year: Optional[Any] = None,
         omdb_api_key: Optional[str] = None,
     ) -> Optional[str]:
-        """Search OMDb by title and year to find IMDb ID."""
+        """Search OMDb by title and year to find IMDb ID with strict title/year validation."""
         if not omdb_api_key or not title:
             return None
         clean_title = re.sub(r"第[一二两三四五六七八九十\d]+季", "", title).strip()
@@ -494,9 +540,21 @@ class ItemResolver:
         try:
             resp = self.session.get(url, params=params, timeout=10)
             if resp.status_code == 200:
-                imdb_id = resp.json().get("imdbID")
-                if imdb_id and imdb_id.startswith("tt"):
-                    return imdb_id
+                data = resp.json()
+                omdb_title = data.get("Title", "")
+                omdb_year = data.get("Year", "")
+                norm_q = re.sub(r"[^\w\u4e00-\u9fa5]", "", (clean_title or title).lower())
+                norm_o = re.sub(r"[^\w\u4e00-\u9fa5]", "", omdb_title.lower())
+                if norm_q and norm_q == norm_o:
+                    if year and omdb_year and omdb_year[:4].isdigit():
+                        try:
+                            if abs(int(omdb_year[:4]) - int(str(year)[:4])) > 1:
+                                return None
+                        except (ValueError, TypeError):
+                            pass
+                    imdb_id = data.get("imdbID")
+                    if imdb_id and imdb_id.startswith("tt"):
+                        return imdb_id
         except Exception as e:
             logger.debug("OMDb search failed for '%s': %s", title, e)
         return None
