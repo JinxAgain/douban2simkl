@@ -32,6 +32,17 @@ class SimklClient:
         self.access_token = access_token
         self._update_headers()
 
+    def verify_token(self) -> bool:
+        """Verify if current access token is valid by querying user settings."""
+        if not self.access_token:
+            return False
+        try:
+            url = f"{SIMKL_API_BASE}/users/settings"
+            resp = self.session.get(url, timeout=10)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
     def request_pin(self) -> Dict[str, Any]:
         """Request a device PIN code for authorization (supports OAuth2 device flow & legacy PIN)."""
         # 1. Try modern OAuth2 Device Authorization (Simkl AUTH V2)

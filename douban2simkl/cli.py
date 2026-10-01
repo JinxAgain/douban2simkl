@@ -52,13 +52,19 @@ def get_or_prompt_simkl_token(
     # 1. Check environment variable
     if config.SIMKL_ACCESS_TOKEN:
         client.set_access_token(config.SIMKL_ACCESS_TOKEN)
-        return config.SIMKL_ACCESS_TOKEN
+        if client.verify_token():
+            return config.SIMKL_ACCESS_TOKEN
+        console.print("[yellow]SIMKL_ACCESS_TOKEN in .env is invalid or unauthenticated. Starting authorization...[/yellow]")
+        client.set_access_token("")
 
     # 2. Check local database
     token = storage.get_setting("simkl_access_token")
     if token:
         client.set_access_token(token)
-        return token
+        if client.verify_token():
+            return token
+        console.print("[yellow]Stored Simkl token in cache is invalid or expired. Starting authorization...[/yellow]")
+        client.set_access_token("")
 
     if dry_run:
         console.print("[yellow][DRY RUN] Skipping Simkl authentication flow.[/yellow]")
@@ -101,8 +107,11 @@ def get_or_prompt_simkl_token(
             config.save_simkl_token(input_cid)
             storage.set_setting("simkl_access_token", input_cid)
             client.set_access_token(input_cid)
-            console.print("[bold green]Saved Simkl Access Token successfully![/bold green]\n")
-            return input_cid
+            if client.verify_token():
+                console.print("[bold green]Saved and verified Simkl Access Token successfully![/bold green]\n")
+                return input_cid
+            else:
+                console.print("[bold red]Provided token is invalid. Please try PIN code authorization.[/bold red]")
 
         client.client_id = input_cid
         config.save_simkl_client_id(input_cid)
@@ -110,12 +119,15 @@ def get_or_prompt_simkl_token(
 
     user_code = pin_data.get("user_code", "")
     verification_url = pin_data.get("verification_url", "https://simkl.com/pin")
+    complete_url = pin_data.get("verification_uri_complete", verification_url)
     expires_in = pin_data.get("expires_in", 900)
     interval = pin_data.get("interval", 5)
 
     pin_panel = f"""
-1. Open this URL in your browser: [bold underline blue]{verification_url}[/bold underline blue]
-2. Enter the PIN code: [bold green font_size=20]{user_code}[/bold green font_size=20]
+1. Open this URL in your browser:
+   [bold underline blue]{complete_url}[/bold underline blue]
+
+2. (If prompted) Enter PIN: [bold green font_size=20]{user_code}[/bold green font_size=20]
 3. Click 'Authorize' to grant access.
 
 Waiting for your approval (expires in {expires_in // 60} minutes)...

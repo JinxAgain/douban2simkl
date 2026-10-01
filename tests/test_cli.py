@@ -63,6 +63,10 @@ def test_get_or_prompt_simkl_token_interactive(tmp_path, monkeypatch):
     monkeypatch.setattr("douban2simkl.cli.config.SIMKL_ACCESS_TOKEN", "")
     monkeypatch.setattr("douban2simkl.cli.config.SIMKL_CLIENT_ID", "")
 
+    monkeypatch.setattr("douban2simkl.cli.config.save_simkl_token", lambda tok: None)
+    monkeypatch.setattr("douban2simkl.cli.config.save_simkl_client_id", lambda cid: None)
+    monkeypatch.setattr("douban2simkl.simkl.SimklClient.verify_token", lambda self: True)
+
     db_file = tmp_path / "test.db"
     storage = Storage(str(db_file))
     client = SimklClient(client_id="")
