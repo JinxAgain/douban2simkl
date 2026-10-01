@@ -64,14 +64,49 @@ def get_or_prompt_simkl_token(
         console.print("[yellow][DRY RUN] Skipping Simkl authentication flow.[/yellow]")
         return "dry_run_token"
 
-    # 3. Request PIN
     console.print("[bold yellow]Simkl authorization required.[/bold yellow]")
-    with console.status("[cyan]Requesting PIN code from Simkl...[/cyan]"):
-        try:
-            pin_data = client.request_pin()
-        except Exception as e:
-            console.print(f"[bold red]Failed to request PIN from Simkl: {e}[/bold red]")
+
+    # Check stored client_id first
+    stored_cid = storage.get_setting("simkl_client_id")
+    if stored_cid:
+        client.client_id = stored_cid
+    elif config.SIMKL_CLIENT_ID:
+        client.client_id = config.SIMKL_CLIENT_ID
+
+    pin_data = None
+    while not pin_data:
+        if client.client_id:
+            try:
+                with console.status("[cyan]Requesting PIN code from Simkl...[/cyan]"):
+                    pin_data = client.request_pin()
+                break
+            except Exception as e:
+                console.print(f"[yellow]Simkl Client ID verification failed ({e}).[/yellow]")
+
+        guide = """
+[bold]To connect to your Simkl account, you need a free Simkl Client ID (takes ~15 seconds):[/bold]
+1. Open this link in your browser: [bold underline blue]https://simkl.com/settings/developer/new/[/bold underline blue]
+2. Fill in:
+   - [bold]Name[/bold]: [green]douban2simkl[/green]
+   - [bold]Redirect URI[/bold]: [green]urn:ietf:wg:oauth:2.0:oob[/green] (or https://simkl.com)
+3. Click [bold]Create App[/bold] and copy the generated [bold]Client ID[/bold].
+"""
+        console.print(Panel(guide, title="[bold yellow]Simkl Client ID Required[/bold yellow]", border_style="yellow"))
+        input_cid = console.input("[bold cyan]Enter your Simkl Client ID (or Access Token): [/bold cyan]").strip()
+        if not input_cid:
             return None
+
+        # Check if the user directly entered a bearer access token
+        if input_cid.startswith("ey") or len(input_cid) > 80:
+            config.save_simkl_token(input_cid)
+            storage.set_setting("simkl_access_token", input_cid)
+            client.set_access_token(input_cid)
+            console.print("[bold green]Saved Simkl Access Token successfully![/bold green]\n")
+            return input_cid
+
+        client.client_id = input_cid
+        config.save_simkl_client_id(input_cid)
+        storage.set_setting("simkl_client_id", input_cid)
 
     user_code = pin_data.get("user_code", "")
     verification_url = pin_data.get("verification_url", "https://simkl.com/pin")

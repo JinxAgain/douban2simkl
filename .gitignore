@@ -17,6 +17,7 @@ douban_archive.jsonl
 douban_full_backup.jsonl
 long_reviews_archive.md
 sync_report*.md
+*.backup
 
 # Cloned reference projects (if submodule/vendored)
 douban-idatabase/

@@ -11,9 +11,9 @@ if ENV_FILE.exists():
 else:
     load_dotenv()
 
-# Default Simkl client ID for zero-friction PIN authentication
-# Users can override this by setting SIMKL_CLIENT_ID in their .env
-DEFAULT_SIMKL_CLIENT_ID = "c5b2c9d69e4a3b118029d20c58e72cbe9b76c8c50eef5f7ce3a22839b2512f46"
+# Simkl client ID for PIN authentication
+# Users can set SIMKL_CLIENT_ID in their .env or will be prompted interactively
+DEFAULT_SIMKL_CLIENT_ID = ""
 
 SIMKL_CLIENT_ID = os.getenv("SIMKL_CLIENT_ID", DEFAULT_SIMKL_CLIENT_ID)
 SIMKL_CLIENT_SECRET = os.getenv("SIMKL_CLIENT_SECRET", "")
@@ -31,3 +31,12 @@ def save_simkl_token(token: str) -> None:
     if not ENV_FILE.exists():
         ENV_FILE.touch()
     set_key(str(ENV_FILE), "SIMKL_ACCESS_TOKEN", token)
+
+
+def save_simkl_client_id(client_id: str) -> None:
+    """Save the Simkl client ID to .env for persistence."""
+    global SIMKL_CLIENT_ID
+    SIMKL_CLIENT_ID = client_id
+    if not ENV_FILE.exists():
+        ENV_FILE.touch()
+    set_key(str(ENV_FILE), "SIMKL_CLIENT_ID", client_id)

@@ -51,3 +51,25 @@ def test_cli_dry_run_pipeline(tmp_path):
         )
 
     assert mock_resolve.call_count == 2
+
+
+def test_get_or_prompt_simkl_token_interactive(tmp_path, monkeypatch):
+    from douban2simkl.cli import get_or_prompt_simkl_token
+    from douban2simkl.simkl import SimklClient
+    from douban2simkl.storage import Storage
+
+    monkeypatch.setattr("douban2simkl.config.SIMKL_ACCESS_TOKEN", "")
+    monkeypatch.setattr("douban2simkl.config.SIMKL_CLIENT_ID", "")
+    monkeypatch.setattr("douban2simkl.cli.config.SIMKL_ACCESS_TOKEN", "")
+    monkeypatch.setattr("douban2simkl.cli.config.SIMKL_CLIENT_ID", "")
+
+    db_file = tmp_path / "test.db"
+    storage = Storage(str(db_file))
+    client = SimklClient(client_id="")
+
+    # Simulate user entering access token directly
+    fake_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy_test_token_string_exceeding_80_chars_for_direct_bearer_auth"
+    with patch("rich.console.Console.input", return_value=fake_token):
+        token = get_or_prompt_simkl_token(client, storage, dry_run=False)
+        assert token == fake_token
+        assert storage.get_setting("simkl_access_token") == fake_token
