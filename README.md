@@ -61,7 +61,13 @@ python run.py --dry-run --input douban_archive.jsonl
 python run.py --input path/to/douban_archive.jsonl
 ```
 
-### 4. Limit Item Count (Testing)
+### 4. Force Online Douban Crawl (Ignoring local archive)
+
+```bash
+python run.py --crawl
+```
+
+### 5. Limit Item Count (Testing)
 
 ```bash
 python run.py --limit 20 --dry-run

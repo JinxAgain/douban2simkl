@@ -147,6 +147,7 @@ def run_pipeline(
     limit: Optional[int] = None,
     batch_size: int = 50,
     skip_auth: bool = False,
+    force_crawl: bool = False,
 ) -> None:
     """Execute the end-to-end sync and export pipeline."""
     print_banner()
@@ -157,31 +158,68 @@ def run_pipeline(
 
     # Step 1: Obtain Douban records
     douban_records: List[Dict[str, Any]] = []
+    archive_path = None
     if input_file:
-        if not os.path.exists(input_file):
-            console.print(f"[bold red]Input file '{input_file}' not found![/bold red]")
+        archive_path = input_file
+    elif not force_crawl:
+        for candidate in ["douban_archive.jsonl", "douban_archive.jsonl.backup"]:
+            if os.path.exists(candidate):
+                archive_path = candidate
+                break
+
+    if archive_path:
+        if not os.path.exists(archive_path):
+            console.print(f"[bold red]Input file '{archive_path}' not found![/bold red]")
             sys.exit(1)
-        console.print(f"[cyan]Loading records from archive file: [bold]{input_file}[/bold]...[/cyan]")
-        douban_records = load_from_archive_file(input_file)
+        console.print(f"[cyan]Loading records from archive file: [bold]{archive_path}[/bold]...[/cyan]")
+        douban_records = load_from_archive_file(archive_path)
     else:
-        # Check if local douban_archive.jsonl exists first as convenience
-        if os.path.exists("douban_archive.jsonl"):
-            console.print("[cyan]Found local [bold]douban_archive.jsonl[/bold], loading directly...[/cyan]")
-            douban_records = load_from_archive_file("douban_archive.jsonl")
-        else:
-            console.print("[cyan]Detecting Douban cookies from local browsers...[/cyan]")
-            try:
-                douban_client = get_douban_client(cookie_string=config.DOUBAN_COOKIE)
-                with console.status("[cyan]Fetching watch history from Douban API...[/cyan]"):
-                    douban_records = douban_client.fetch_all_movie_interests()
-            except Exception as e:
-                console.print(f"[yellow]Could not automatically fetch Douban records: {e}[/yellow]")
-                prompt_path = console.input("[bold yellow]Please enter path to a Douban JSONL archive file: [/bold yellow]").strip()
-                if prompt_path and os.path.exists(prompt_path):
-                    douban_records = load_from_archive_file(prompt_path)
-                else:
-                    console.print("[bold red]No valid Douban data source available. Exiting.[/bold red]")
-                    sys.exit(1)
+        console.print("[cyan]Detecting Douban cookies from local browsers...[/cyan]")
+        try:
+            douban_client = get_douban_client(cookie_string=config.DOUBAN_COOKIE)
+            user_info = douban_client.checkin()
+            console.print(
+                f"[green]Logged in to Douban as: [bold]{user_info.get('username')}[/bold] (UID: {user_info.get('uid')})[/green]"
+            )
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=console,
+            ) as fetch_progress:
+                fetch_task = fetch_progress.add_task("[cyan]Scanning Douban collections...", total=None)
+
+                def on_init(status_totals: Dict[str, int], grand_total: int) -> None:
+                    fetch_progress.update(
+                        fetch_task,
+                        total=grand_total if grand_total > 0 else 100,
+                        description=f"[cyan]Found {grand_total} records. Fetching...",
+                    )
+
+                def on_progress(status_name: str, cur_status: int, total_status: int, total_all: int, grand_total: int) -> None:
+                    status_cn = {"done": "看过", "doing": "在看", "mark": "想看"}.get(status_name, status_name)
+                    fetch_progress.update(
+                        fetch_task,
+                        completed=total_all,
+                        total=grand_total if grand_total > 0 else total_status,
+                        description=f"[cyan]Fetching [{status_cn}] ({cur_status}/{total_status})",
+                    )
+
+                douban_records = douban_client.fetch_all_movie_interests(
+                    on_init=on_init, on_progress=on_progress
+                )
+        except Exception as e:
+            console.print(f"[yellow]Could not automatically fetch Douban records: {e}[/yellow]")
+            prompt_path = console.input("[bold yellow]Please enter path to a Douban JSONL archive file: [/bold yellow]").strip()
+            if prompt_path and os.path.exists(prompt_path):
+                douban_records = load_from_archive_file(prompt_path)
+            else:
+                console.print("[bold red]No valid Douban data source available. Exiting.[/bold red]")
+                sys.exit(1)
 
     total_scanned = len(douban_records)
     console.print(f"[bold green]Loaded {total_scanned} records from Douban.[/bold green]\n")
@@ -430,6 +468,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="Limit number of items to process")
     parser.add_argument("--batch-size", type=int, default=50, help="Batch size for Simkl sync calls")
     parser.add_argument("--skip-auth", action="store_true", help="Skip Simkl authorization and only export local backups")
+    parser.add_argument("--crawl", action="store_true", help="Force online crawling from Douban even if local archive file exists")
 
     args = parser.parse_args()
     run_pipeline(
@@ -439,6 +478,7 @@ def main() -> None:
         limit=args.limit,
         batch_size=args.batch_size,
         skip_auth=args.skip_auth,
+        force_crawl=args.crawl,
     )
 
 

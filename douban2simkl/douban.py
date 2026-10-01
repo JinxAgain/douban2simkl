@@ -99,8 +99,20 @@ class DoubanClient:
         username = str(user_el.get("data-name") or "")
         return {"uid": uid, "username": username}
 
+    def get_interests_count(self, uid: str, status: str) -> int:
+        """Fetch total count of interests for a status."""
+        url = URL_INTERESTS.format(
+            uid=uid, type="movie", status=status, start=0, count=1, ck=self.ck
+        )
+        resp = self.request("GET", url, referer="https://m.douban.com/mine/movie")
+        if resp.status_code == 200:
+            return int(resp.json().get("total", 0))
+        return 0
+
     def fetch_all_movie_interests(
-        self, on_progress: Optional[Callable[[int, int], None]] = None
+        self,
+        on_init: Optional[Callable[[Dict[str, int], int], None]] = None,
+        on_progress: Optional[Callable[..., None]] = None,
     ) -> List[Dict[str, Any]]:
         """Fetch all movie and TV show interests (done, mark, doing) from Douban."""
         user_info = self.checkin()
@@ -108,9 +120,22 @@ class DoubanClient:
         all_items: List[Dict[str, Any]] = []
 
         statuses = ["done", "doing", "mark"]
+        status_totals: Dict[str, int] = {}
+        for st in statuses:
+            try:
+                status_totals[st] = self.get_interests_count(uid, st)
+            except Exception:
+                status_totals[st] = 0
+
+        grand_total = sum(status_totals.values())
+        if on_init:
+            on_init(status_totals, grand_total)
+
         for status in statuses:
             start = 0
-            page_count = 1
+            total_in_status = status_totals.get(status, 0)
+            page_count = math.ceil(total_in_status / PAGE_SIZE) if total_in_status else 1
+            status_count = 0
             while start < page_count * PAGE_SIZE:
                 url = URL_INTERESTS.format(
                     uid=uid, type="movie", status=status, start=start, count=PAGE_SIZE, ck=self.ck
@@ -118,9 +143,13 @@ class DoubanClient:
                 resp = self.request("GET", url, referer="https://m.douban.com/mine/movie")
                 if resp.status_code == 200:
                     data = resp.json()
-                    total_in_status = int(data.get("total", 0))
-                    page_count = math.ceil(total_in_status / PAGE_SIZE) if total_in_status else 1
+                    if "total" in data:
+                        total_in_status = int(data["total"])
+                        page_count = math.ceil(total_in_status / PAGE_SIZE) if total_in_status else 1
+
                     interests = data.get("interests", [])
+                    if not interests:
+                        break
                     for item in interests:
                         subject = item.get("subject", {})
                         douban_id = str(subject.get("id", ""))
@@ -143,7 +172,12 @@ class DoubanClient:
                                 "link": subject.get("url", f"https://movie.douban.com/subject/{douban_id}/"),
                             }
                         )
-                        if on_progress:
+                        status_count += 1
+
+                    if on_progress:
+                        try:
+                            on_progress(status, status_count, total_in_status, len(all_items), grand_total)
+                        except TypeError:
                             on_progress(len(all_items), total_in_status)
                     start += PAGE_SIZE
                 elif resp.status_code == 500:
