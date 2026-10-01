@@ -83,6 +83,29 @@ class SimklClient:
 
         return existing_ids
 
+    def _post_with_rate_limit(self, url: str, payload: Dict[str, Any], max_retries: int = 3) -> requests.Response:
+        """Execute POST request respecting Simkl's 1 POST/sec limit and handling 429 backoff."""
+        if not hasattr(self, "_last_post_time"):
+            self._last_post_time = 0.0
+
+        elapsed = time.time() - self._last_post_time
+        if elapsed < 1.0:
+            time.sleep(1.0 - elapsed)
+
+        for attempt in range(max_retries):
+            resp = self.session.post(url, json=payload, timeout=30)
+            self._last_post_time = time.time()
+            if resp.status_code == 429:
+                wait_seconds = int(resp.headers.get("Retry-After", 3 * (attempt + 1)))
+                logger.warning("Simkl rate limit hit (429). Retrying in %ds...", wait_seconds)
+                time.sleep(wait_seconds)
+                continue
+            resp.raise_for_status()
+            return resp
+
+        resp.raise_for_status()
+        return resp
+
     def sync_history_batch(
         self,
         movies: Optional[List[Dict[str, Any]]] = None,
@@ -96,8 +119,7 @@ class SimklClient:
         if shows:
             payload["shows"] = shows
 
-        resp = self.session.post(url, json=payload, timeout=30)
-        resp.raise_for_status()
+        resp = self._post_with_rate_limit(url, payload)
         return resp.json()
 
     def add_to_list_batch(
@@ -116,6 +138,5 @@ class SimklClient:
         if shows:
             payload["shows"] = shows
 
-        resp = self.session.post(url, json=payload, timeout=30)
-        resp.raise_for_status()
+        resp = self._post_with_rate_limit(url, payload)
         return resp.json()
