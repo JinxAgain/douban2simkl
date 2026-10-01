@@ -82,3 +82,27 @@ def test_generate_sync_report(tmp_path):
     assert "Douban to Simkl Sync Report" in report
     assert "**Total Scanned**: 100" in report
     assert os.path.exists(output_file)
+
+
+def test_export_unresolved_items(tmp_path):
+    from douban2simkl.exporter import export_unresolved_items
+
+    output_file = tmp_path / "unresolved_items.md"
+    records = [
+        {
+            "douban_id": "99999999",
+            "title": "未知短片",
+            "year": 2024,
+            "type": "movie",
+            "status": "done",
+            "imdb_id": None,
+        }
+    ]
+
+    count = export_unresolved_items(records, str(output_file))
+    assert count == 1
+    assert os.path.exists(output_file)
+    content = output_file.read_text(encoding="utf-8")
+    assert "未知短片" in content
+    assert "99999999" in content
+

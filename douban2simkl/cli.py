@@ -10,6 +10,13 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import (
@@ -25,9 +32,14 @@ from rich.table import Table
 
 from douban2simkl import config
 from douban2simkl.douban import DoubanClient, get_douban_client, load_from_archive_file
-from douban2simkl.exporter import export_full_backup, export_long_reviews, generate_sync_report
+from douban2simkl.exporter import (
+    export_full_backup,
+    export_long_reviews,
+    export_unresolved_items,
+    generate_sync_report,
+)
 from douban2simkl.normalizer import calibrate_rating, normalize_comment
-from douban2simkl.resolver import DoubanResolver
+from douban2simkl.resolver import DoubanResolver, extract_season_number
 from douban2simkl.simkl import SimklClient
 from douban2simkl.storage import Storage
 
@@ -276,25 +288,31 @@ def run_pipeline(
     # Step 4: Resolution, Calibration, and Batch Sync
     enriched_records: List[Dict[str, Any]] = []
     long_reviews: List[Dict[str, Any]] = []
+    unresolved_items: List[Dict[str, Any]] = []
 
     already_in_simkl_count = 0
     new_to_sync_count = 0
     synced_count = 0
-    failed_count = 0
+    simkl_errors_count = 0
+    unresolved_count = 0
 
     history_movies_batch: List[Dict[str, Any]] = []
     history_shows_batch: List[Dict[str, Any]] = []
-    watchlist_items_batch: List[Dict[str, Any]] = []
-    pending_sync_ids: List[str] = []
+    watchlist_movies_batch: List[Dict[str, Any]] = []
+    watchlist_shows_batch: List[Dict[str, Any]] = []
+    pending_history_ids: List[str] = []
+    pending_watchlist_ids: List[str] = []
 
     def flush_batches() -> None:
-        nonlocal synced_count, failed_count
+        nonlocal synced_count, simkl_errors_count
         if dry_run or skip_auth:
-            synced_count += len(pending_sync_ids)
-            pending_sync_ids.clear()
+            synced_count += len(pending_history_ids) + len(pending_watchlist_ids)
+            pending_history_ids.clear()
+            pending_watchlist_ids.clear()
             history_movies_batch.clear()
             history_shows_batch.clear()
-            watchlist_items_batch.clear()
+            watchlist_movies_batch.clear()
+            watchlist_shows_batch.clear()
             return
 
         if history_movies_batch or history_shows_batch:
@@ -303,31 +321,52 @@ def run_pipeline(
                     movies=history_movies_batch if history_movies_batch else None,
                     shows=history_shows_batch if history_shows_batch else None,
                 )
-                for did in pending_sync_ids:
+                for did in pending_history_ids:
                     storage.mark_synced(did, "synced")
-                synced_count += len(pending_sync_ids)
+                synced_count += len(pending_history_ids)
             except Exception as e:
                 logger.error("Failed to push history batch: %s", e)
-                for did in pending_sync_ids:
+                for did in pending_history_ids:
                     storage.mark_synced(did, f"error: {e}")
-                failed_count += len(pending_sync_ids)
+                simkl_errors_count += len(pending_history_ids)
 
-        if watchlist_items_batch:
-            # Group by 'to' status
-            by_status: Dict[str, List[Dict[str, Any]]] = {}
-            for it in watchlist_items_batch:
+        if watchlist_movies_batch or watchlist_shows_batch:
+            by_status_movies: Dict[str, List[Dict[str, Any]]] = {}
+            for it in watchlist_movies_batch:
                 st = it.pop("to", "plantowatch")
-                by_status.setdefault(st, []).append(it)
-            for st, items in by_status.items():
-                try:
-                    simkl_client.add_to_list_batch(movies=items, to=st)
-                except Exception as e:
-                    logger.error("Failed to push watchlist batch: %s", e)
+                by_status_movies.setdefault(st, []).append(it)
 
-        pending_sync_ids.clear()
+            by_status_shows: Dict[str, List[Dict[str, Any]]] = {}
+            for it in watchlist_shows_batch:
+                st = it.pop("to", "plantowatch")
+                by_status_shows.setdefault(st, []).append(it)
+
+            all_statuses = set(by_status_movies.keys()) | set(by_status_shows.keys())
+            success = True
+            for st in all_statuses:
+                m_items = by_status_movies.get(st)
+                s_items = by_status_shows.get(st)
+                try:
+                    simkl_client.add_to_list_batch(movies=m_items, shows=s_items, to=st)
+                except Exception as e:
+                    logger.error("Failed to push watchlist batch (%s): %s", st, e)
+                    success = False
+
+            if success:
+                for did in pending_watchlist_ids:
+                    storage.mark_synced(did, "synced")
+                synced_count += len(pending_watchlist_ids)
+            else:
+                for did in pending_watchlist_ids:
+                    storage.mark_synced(did, "watchlist_error")
+                simkl_errors_count += len(pending_watchlist_ids)
+
+        pending_history_ids.clear()
+        pending_watchlist_ids.clear()
         history_movies_batch.clear()
         history_shows_batch.clear()
-        watchlist_items_batch.clear()
+        watchlist_movies_batch.clear()
+        watchlist_shows_batch.clear()
 
     # Bulk Wikidata Pre-fetch: query Wikidata SPARQL in batches of 100 for all uncached items
     uncached_ids = [
@@ -357,7 +396,65 @@ def run_pipeline(
 
             wiki_results = resolver.batch_resolve_wikidata(uncached_ids, on_progress=on_wiki_progress)
             console.print(
-                f"[bold green]✓ Pre-resolved {len(wiki_results)} items via Wikidata (zero Douban requests)![/bold green]\n"
+                f"[bold green][OK] Pre-resolved {len(wiki_results)} items via Wikidata (zero Douban requests)![/bold green]\n"
+            )
+
+    # Bulk parent series pre-fetch for multi-season TV shows (Season > 1) via Wikidata
+    needs_series_resolution: Dict[str, Dict[str, Any]] = {}
+    for r in douban_records:
+        did = str(r.get("douban_id", ""))
+        title = r.get("title", "")
+        season = extract_season_number(title)
+        if season and season > 1:
+            mapping = storage.get_imdb_mapping(did)
+            if mapping and mapping.get("imdb_id") and not mapping.get("series_imdb_id"):
+                ep_imdb = mapping["imdb_id"]
+                if ep_imdb.startswith("tt"):
+                    needs_series_resolution[ep_imdb] = {
+                        "douban_id": did,
+                        "season": season,
+                        "title": title,
+                    }
+
+    if needs_series_resolution:
+        ep_ids = list(needs_series_resolution.keys())
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as series_progress:
+            series_task = series_progress.add_task(
+                "[cyan]Pre-fetching parent series IDs for multi-season TV shows...",
+                total=len(ep_ids),
+            )
+
+            def on_series_progress(completed: int, total: int, matches: int) -> None:
+                series_progress.update(
+                    series_task,
+                    completed=completed,
+                    total=total,
+                    description=f"[cyan]Wikidata TV Series Graph (matched {matches} series)...",
+                )
+
+            series_results = resolver.batch_resolve_parent_series_wikidata(
+                ep_ids, on_progress=on_series_progress
+            )
+            for ep_id, s_imdb in series_results.items():
+                info = needs_series_resolution.get(ep_id)
+                if info:
+                    storage.save_imdb_mapping(
+                        douban_id=info["douban_id"],
+                        imdb_id=ep_id,
+                        series_imdb_id=s_imdb,
+                        season=info["season"],
+                        title=info["title"],
+                    )
+            console.print(
+                f"[bold green][OK] Pre-resolved {len(series_results)} parent TV series mappings via Wikidata![/bold green]\n"
             )
 
     workers = min(max(1, threads), 5)
@@ -424,8 +521,15 @@ def run_pipeline(
                     already_in_simkl_count += 1
                     record_sync_status = "already_synced"
                 elif not imdb_id:
-                    failed_count += 1
+                    unresolved_count += 1
                     record_sync_status = "unresolved_no_imdb"
+                    unresolved_items.append({
+                        "douban_id": douban_id,
+                        "title": title,
+                        "year": item.get("year"),
+                        "type": "tv" if (is_tv or season) else "movie",
+                        "status": status,
+                    })
                 else:
                     new_to_sync_count += 1
                     # Prepare payload
@@ -453,19 +557,26 @@ def run_pipeline(
                             if memo_text:
                                 movie_obj["memo"] = {"text": memo_text, "is_private": False}
                             history_movies_batch.append(movie_obj)
-                        pending_sync_ids.append(douban_id)
+                        pending_history_ids.append(douban_id)
                     elif status in ("mark", "doing"):
                         simkl_to = "watching" if status == "doing" else "plantowatch"
-                        watchlist_obj = {
-                            "ids": {"imdb": series_imdb_id or imdb_id},
-                            "to": simkl_to,
-                        }
-                        watchlist_items_batch.append(watchlist_obj)
-                        pending_sync_ids.append(douban_id)
+                        if is_tv or season:
+                            watchlist_show = {
+                                "ids": {"imdb": series_imdb_id or imdb_id},
+                                "to": simkl_to,
+                            }
+                            watchlist_shows_batch.append(watchlist_show)
+                        else:
+                            watchlist_movie = {
+                                "ids": {"imdb": imdb_id},
+                                "to": simkl_to,
+                            }
+                            watchlist_movies_batch.append(watchlist_movie)
+                        pending_watchlist_ids.append(douban_id)
 
                     record_sync_status = "synced"
 
-                    if len(pending_sync_ids) >= batch_size:
+                    if len(pending_history_ids) + len(pending_watchlist_ids) >= batch_size:
                         flush_batches()
 
                 enriched_entry = {
@@ -501,13 +612,16 @@ def run_pipeline(
     export_full_backup(enriched_records, "douban_full_backup.jsonl")
     if long_reviews:
         export_long_reviews(long_reviews, "long_reviews_archive.md")
+    if unresolved_items:
+        export_unresolved_items(unresolved_items, "unresolved_items.md")
 
     stats = {
         "total_scanned": total_scanned,
         "already_in_simkl": already_in_simkl_count,
         "new_to_sync": new_to_sync_count,
         "synced": synced_count,
-        "failed": failed_count,
+        "simkl_errors": simkl_errors_count,
+        "unresolved": unresolved_count,
         "long_reviews_count": len(long_reviews),
     }
     generate_sync_report(stats, "sync_report.md")
@@ -520,17 +634,31 @@ def run_pipeline(
     table.add_row("Already in Simkl (Skipped)", str(already_in_simkl_count))
     table.add_row("New Items to Sync", str(new_to_sync_count))
     table.add_row("Successfully Synced", str(synced_count))
-    table.add_row("Failed / Unresolved IMDb", str(failed_count))
+    if simkl_errors_count > 0:
+        table.add_row("Simkl API Errors", f"[bold red]{simkl_errors_count}[/bold red]")
+    else:
+        table.add_row("Simkl API Errors", "0")
+    if unresolved_count > 0:
+        table.add_row("Unresolved IMDb (Missing)", f"[bold yellow]{unresolved_count}[/bold yellow]")
+    else:
+        table.add_row("Unresolved IMDb (Missing)", "0")
     table.add_row("Long Reviews Archived (>140 chars)", str(len(long_reviews)))
 
     console.print(table)
+    files_list = [
+        "- [bold]douban_full_backup.jsonl[/bold] (Enriched full backup with IMDb IDs and calibrated ratings)",
+        "- [bold]long_reviews_archive.md[/bold] (Full text archive for reviews exceeding 140 chars)",
+        "- [bold]sync_report.md[/bold] (Detailed summary report)",
+        "- [bold]douban2simkl.db[/bold] (Local SQLite cache)",
+    ]
+    if unresolved_items:
+        files_list.append(
+            "- [bold yellow]unresolved_items.md[/bold yellow] (Detailed list of unresolved items with direct Douban links)"
+        )
+
     console.print(
         Panel.fit(
-            "[bold green]Files Generated:[/bold green]\n"
-            "- [bold]douban_full_backup.jsonl[/bold] (Enriched full backup with IMDb IDs and calibrated ratings)\n"
-            "- [bold]long_reviews_archive.md[/bold] (Full text archive for reviews exceeding 140 chars)\n"
-            "- [bold]sync_report.md[/bold] (Detailed summary report)\n"
-            "- [bold]douban2simkl.db[/bold] (Local SQLite cache)",
+            "[bold green]Files Generated:[/bold green]\n" + "\n".join(files_list),
             border_style="blue",
         )
     )

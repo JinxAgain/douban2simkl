@@ -1,11 +1,25 @@
 import logging
 import re
+import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import requests
 from douban2simkl.storage import Storage
 
 logger = logging.getLogger(__name__)
+
+_douban_lock = threading.Lock()
+_last_douban_request = 0.0
+
+
+def _throttle_douban(min_interval: float = 1.5) -> None:
+    global _last_douban_request
+    with _douban_lock:
+        now = time.time()
+        elapsed = now - _last_douban_request
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        _last_douban_request = time.time()
 
 CHINESE_NUMS = {
     "一": 1,
@@ -119,7 +133,7 @@ class ItemResolver:
             }}
             """
             try:
-                resp = requests.post(
+                resp = self.session.post(
                     WIKIDATA_SPARQL_URL,
                     data={"query": query, "format": "json"},
                     headers=WIKIDATA_HEADERS,
@@ -177,9 +191,10 @@ class ItemResolver:
         return None
 
     def fetch_douban_imdb_id(self, douban_id: str, max_retries: int = 2) -> Optional[str]:
-        """Fetch IMDb ID directly from Douban pages with rate limit backoff."""
+        """Fetch IMDb ID directly from Douban pages with thread-safe rate limit backoff."""
         # 1. Try mobile description page
         for attempt in range(max_retries + 1):
+            _throttle_douban(1.5)
             try:
                 url = DOUBAN_DESC_URL.format(douban_id)
                 resp = self.session.get(url, headers=COMMON_HEADERS, timeout=12)
@@ -199,6 +214,7 @@ class ItemResolver:
 
         # 2. Fallback to desktop subject page
         for attempt in range(max_retries + 1):
+            _throttle_douban(1.5)
             try:
                 url = DOUBAN_DESKTOP_URL.format(douban_id)
                 resp = self.session.get(url, headers=COMMON_HEADERS, timeout=12)
@@ -217,6 +233,56 @@ class ItemResolver:
                 break
 
         return None
+
+    def batch_resolve_parent_series_wikidata(
+        self,
+        episode_imdb_ids: List[str],
+        chunk_size: int = 100,
+        on_progress: Optional[Any] = None,
+    ) -> Dict[str, str]:
+        """Batch resolve TV episode/season IMDb IDs to parent Series IMDb IDs via Wikidata."""
+        series_map: Dict[str, str] = {}
+        valid_ids = list(set([str(x).strip() for x in episode_imdb_ids if str(x).strip().startswith("tt")]))
+        if not valid_ids:
+            return series_map
+
+        for i in range(0, len(valid_ids), chunk_size):
+            chunk = valid_ids[i : i + chunk_size]
+            values_str = " ".join(f'"{did}"' for did in chunk)
+            query = f"""
+            SELECT ?ep_imdb ?series_imdb WHERE {{
+              VALUES ?ep_imdb {{ {values_str} }}
+              ?ep wdt:P345 ?ep_imdb .
+              ?ep (wdt:P179|wdt:P361|wdt:P4969) ?series .
+              ?series wdt:P345 ?series_imdb .
+            }}
+            """
+            try:
+                resp = self.session.post(
+                    WIKIDATA_SPARQL_URL,
+                    data={"query": query, "format": "json"},
+                    headers=WIKIDATA_HEADERS,
+                    timeout=25,
+                )
+                if resp.status_code == 200:
+                    bindings = resp.json().get("results", {}).get("bindings", [])
+                    for b in bindings:
+                        ep = b.get("ep_imdb", {}).get("value")
+                        series = b.get("series_imdb", {}).get("value")
+                        if ep and series and series.startswith("tt"):
+                            series_map[ep] = series
+            except Exception as e:
+                logger.warning("Wikidata parent series query failed: %s", e)
+
+            if on_progress:
+                try:
+                    on_progress(min(i + chunk_size, len(valid_ids)), len(valid_ids), len(series_map))
+                except Exception:
+                    pass
+
+            time.sleep(0.2)
+
+        return series_map
 
     def resolve_series_imdb_id(
         self,
@@ -261,6 +327,30 @@ class ItemResolver:
                         return series_id
             except Exception:
                 pass
+
+        # 3. Try Wikidata Knowledge Graph (free, no API key required)
+        query = f"""
+        SELECT ?series_imdb WHERE {{
+          ?ep wdt:P345 "{episode_imdb_id}" .
+          ?ep (wdt:P179|wdt:P361|wdt:P4969) ?series .
+          ?series wdt:P345 ?series_imdb .
+        }} LIMIT 1
+        """
+        try:
+            resp = self.session.post(
+                WIKIDATA_SPARQL_URL,
+                data={"query": query, "format": "json"},
+                headers=WIKIDATA_HEADERS,
+                timeout=12,
+            )
+            if resp.status_code == 200:
+                bindings = resp.json().get("results", {}).get("bindings", [])
+                if bindings:
+                    s_id = bindings[0].get("series_imdb", {}).get("value")
+                    if s_id and s_id.startswith("tt"):
+                        return s_id
+        except Exception as e:
+            logger.debug("Wikidata series lookup failed for %s: %s", episode_imdb_id, e)
 
         return None
 

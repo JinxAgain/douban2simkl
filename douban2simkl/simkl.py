@@ -33,22 +33,37 @@ class SimklClient:
         self._update_headers()
 
     def verify_token(self) -> bool:
-        """Verify if current access token is valid by querying user settings."""
+        """Verify if current access token is valid and has write permission."""
         if not self.access_token:
             return False
         try:
+            # 1. Check basic read access
             url = f"{SIMKL_API_BASE}/users/settings"
             resp = self.session.get(url, timeout=10)
-            return resp.status_code == 200
+            if resp.status_code != 200:
+                return False
+
+            # 2. Check media:write scope via empty sync check
+            check_url = f"{SIMKL_API_BASE}/sync/history"
+            check_resp = self.session.post(check_url, json={}, timeout=10)
+            if check_resp.status_code == 403 and "insufficient_scope" in check_resp.text:
+                logger.warning("Simkl token lacks 'media:write' scope (403 insufficient_scope).")
+                return False
+
+            return True
         except Exception:
             return False
 
     def request_pin(self) -> Dict[str, Any]:
-        """Request a device PIN code for authorization (supports OAuth2 device flow & legacy PIN)."""
+        """Request a device PIN code for authorization (supports OAuth2 device flow with write scope & legacy PIN)."""
         # 1. Try modern OAuth2 Device Authorization (Simkl AUTH V2)
         try:
             url = f"{SIMKL_API_BASE}/oauth2/device"
-            resp = self.session.post(url, json={"client_id": self.client_id}, timeout=15)
+            resp = self.session.post(
+                url,
+                json={"client_id": self.client_id, "scope": "media:read media:write"},
+                timeout=15,
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 self._device_code = data.get("device_code")

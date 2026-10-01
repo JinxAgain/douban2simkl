@@ -56,6 +56,32 @@ def export_long_reviews(reviews: List[Dict[str, Any]], output_path: str = "long_
     return written
 
 
+def export_unresolved_items(records: List[Dict[str, Any]], output_path: str = "unresolved_items.md") -> int:
+    """Export failed/unresolved items to a separate Markdown document with direct Douban links."""
+    written = 0
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("# Unresolved Douban Items (Missing IMDb ID)\n\n")
+        f.write(
+            f"> Generated on {now_str}  \n"
+            f"> Total unresolved items: {len(records)}  \n"
+            f"> These items could not be automatically mapped to IMDb via Wikidata, NeoDB, or Douban.\n\n---\n\n"
+        )
+        f.write("| Douban ID | Title | Year | Type | Status | Link |\n")
+        f.write("| :--- | :--- | :---: | :---: | :---: | :--- |\n")
+        for item in records:
+            did = item.get("douban_id", "")
+            title = item.get("title", "")
+            year = item.get("year", "") or "-"
+            item_type = item.get("type", "movie")
+            status = item.get("status", "done")
+            link = f"https://movie.douban.com/subject/{did}/"
+            f.write(f"| `{did}` | **{title}** | {year} | `{item_type}` | `{status}` | [View on Douban]({link}) |\n")
+            written += 1
+    logger.info("Exported %d unresolved items to %s", written, output_path)
+    return written
+
+
 def generate_sync_report(stats: Dict[str, Any], output_path: str = "sync_report.md") -> str:
     """Generate a Markdown sync summary report."""
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -69,13 +95,15 @@ def generate_sync_report(stats: Dict[str, Any], output_path: str = "sync_report.
 - **Already in Simkl (Skipped)**: {stats.get('already_in_simkl', 0)}
 - **New Items to Sync**: {stats.get('new_to_sync', 0)}
 - **Successfully Synced**: {stats.get('synced', 0)}
-- **Failed / Unresolved**: {stats.get('failed', 0)}
+- **Simkl API Errors**: {stats.get('simkl_errors', 0)}
+- **Unresolved IMDb**: {stats.get('unresolved', 0)}
 - **Long Reviews Archived (>140 chars)**: {stats.get('long_reviews_count', 0)}
 
 ## Files Generated
 
 - Full enriched backup: `douban_full_backup.jsonl`
 - Long reviews archive: `long_reviews_archive.md`
+- Unresolved items list: `unresolved_items.md` (if any missing IMDb)
 - Local cache database: `douban2simkl.db`
 """
     with open(output_path, "w", encoding="utf-8") as f:
