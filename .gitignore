@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Environment and sensitive files
+.env
+*.db
+*.sqlite
+*.sqlite3
+
+# Local backups and output files
+douban_archive.jsonl
+douban_full_backup.jsonl
+long_reviews_archive.md
+sync_report*.md
+
+# Cloned reference projects (if submodule/vendored)
+# douban-idatabase/
+# douban-backup/
