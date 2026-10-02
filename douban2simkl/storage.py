@@ -158,7 +158,7 @@ class Storage:
             conn.commit()
 
     def get_failed_sync_records(self) -> List[Dict[str, Any]]:
-        """Retrieve all records from sync_state where status is not 'synced' joined with cached IMDb metadata."""
+        """Retrieve all records from sync_state where status indicates an error joined with cached IMDb metadata."""
         with self._get_connection() as conn:
             rows = conn.execute(
                 """
@@ -166,7 +166,7 @@ class Storage:
                        i.title, i.imdb_id, i.series_imdb_id, i.tmdb_id, i.tvdb_id, i.season
                 FROM sync_state s
                 LEFT JOIN imdb_cache i ON s.douban_id = i.douban_id
-                WHERE s.status != 'synced'
+                WHERE s.status LIKE 'error:%' OR s.status NOT IN ('synced', 'already_synced', 'removed')
                 ORDER BY s.synced_at DESC
                 """
             ).fetchall()

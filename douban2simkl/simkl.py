@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 
 logger = logging.getLogger(__name__)
@@ -110,35 +110,90 @@ class SimklClient:
                 return token
         return None
 
-    def get_existing_library_ids(self) -> Set[str]:
-        """Fetch all existing movie and show IDs from user library for deduplication."""
-        existing_ids: Set[str] = set()
-        endpoints = [
-            f"{SIMKL_API_BASE}/sync/all-items/movies",
-            f"{SIMKL_API_BASE}/sync/all-items/shows",
-        ]
+    def get_existing_library_data(self) -> Dict[str, Any]:
+        """Fetch detailed existing library data distinguishing movies, shows, and individual seasons.
 
-        for url in endpoints:
-            try:
-                resp = self.session.get(url, params={"extended": "ids_only"}, timeout=30)
-                if resp.status_code != 200:
-                    logger.warning("Failed to fetch library from %s: HTTP %d", url, resp.status_code)
-                    continue
+        Returns:
+            Dict containing:
+                - 'movie_ids': Set[str] of all movie IDs (IMDb, TMDb, Simkl IDs in lowercase)
+                - 'show_ids': Set[str] of all show root IDs in lowercase
+                - 'show_seasons': Set[Tuple[str, int]] of (show_id_lowercase, season_number)
+                - 'completed_shows': Set[str] of show IDs marked as completed
+                - 'all_ids': Set[str] of all media IDs (union of movie and show IDs)
+        """
+        movie_ids: Set[str] = set()
+        show_ids: Set[str] = set()
+        show_seasons: Set[Tuple[str, int]] = set()
+        completed_shows: Set[str] = set()
+
+        # 1. Fetch movies
+        movies_url = f"{SIMKL_API_BASE}/sync/all-items/movies"
+        try:
+            resp = self.session.get(movies_url, params={"extended": "ids_only"}, timeout=30)
+            if resp.status_code == 200:
                 data = resp.json()
-
-                for list_key in ("movies", "shows", "anime"):
+                for list_key in ("movies", "anime"):
                     items = data.get(list_key, [])
                     for item in items:
-                        # Item may be wrapped like {"movie": {"ids": ...}} or directly {"ids": ...}
-                        target = item.get("movie") or item.get("show") or item.get("anime") or item
+                        target = item.get("movie") or item.get("anime") or item
                         ids_dict = target.get("ids", {})
-                        for _, val in ids_dict.items():
+                        for val in ids_dict.values():
                             if val:
-                                existing_ids.add(str(val).strip())
-            except Exception as e:
-                logger.error("Error fetching Simkl library from %s: %s", url, e)
+                                movie_ids.add(str(val).lower().strip())
+            else:
+                logger.warning("Failed to fetch movie library from %s: HTTP %d", movies_url, resp.status_code)
+        except Exception as e:
+            logger.error("Error fetching Simkl movie library: %s", e)
 
-        return existing_ids
+        # 2. Fetch shows with full season details
+        shows_url = f"{SIMKL_API_BASE}/sync/all-items/shows"
+        try:
+            resp = self.session.get(
+                shows_url,
+                params={"extended": "full", "include_all_episodes": "yes"},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("shows", [])
+                for item in items:
+                    show_obj = item.get("show") or item
+                    ids_dict = show_obj.get("ids", {})
+                    st = str(item.get("status", "")).lower()
+
+                    current_show_ids: List[str] = []
+                    for val in ids_dict.values():
+                        if val:
+                            v_str = str(val).lower().strip()
+                            show_ids.add(v_str)
+                            current_show_ids.append(v_str)
+                            if st == "completed":
+                                completed_shows.add(v_str)
+
+                    seasons = item.get("seasons", [])
+                    for s in seasons:
+                        s_num = s.get("number")
+                        if s_num is not None:
+                            for sid in current_show_ids:
+                                show_seasons.add((sid, int(s_num)))
+            else:
+                logger.warning("Failed to fetch show library from %s: HTTP %d", shows_url, resp.status_code)
+        except Exception as e:
+            logger.error("Error fetching Simkl show library: %s", e)
+
+        all_ids = movie_ids.union(show_ids)
+        return {
+            "movie_ids": movie_ids,
+            "show_ids": show_ids,
+            "show_seasons": show_seasons,
+            "completed_shows": completed_shows,
+            "all_ids": all_ids,
+        }
+
+    def get_existing_library_ids(self) -> Set[str]:
+        """Fetch all existing movie and show IDs from user library for deduplication."""
+        data = self.get_existing_library_data()
+        return data["all_ids"]
 
     def _post_with_rate_limit(self, url: str, payload: Dict[str, Any], max_retries: int = 3) -> requests.Response:
         """Execute POST request respecting Simkl's 1 POST/sec limit and handling 429 backoff."""

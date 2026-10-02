@@ -279,10 +279,19 @@ def run_pipeline(
             sys.exit(1)
 
     # Step 3: Fetch Simkl Library for Deduplication
+    simkl_movie_ids: Set[str] = set()
+    simkl_show_ids: Set[str] = set()
+    simkl_show_seasons: Set[Tuple[str, int]] = set()
+    simkl_completed_shows: Set[str] = set()
     simkl_existing_ids: Set[str] = set()
     if not skip_auth and not dry_run:
         with console.status("[cyan]Fetching existing library from Simkl for deduplication...[/cyan]"):
-            simkl_existing_ids = simkl_client.get_existing_library_ids()
+            library_data = simkl_client.get_existing_library_data()
+            simkl_movie_ids = library_data["movie_ids"]
+            simkl_show_ids = library_data["show_ids"]
+            simkl_show_seasons = library_data["show_seasons"]
+            simkl_completed_shows = library_data["completed_shows"]
+            simkl_existing_ids = library_data["all_ids"]
             console.print(
                 f"[bold green]Found {len(simkl_existing_ids)} items in your Simkl library.[/bold green]\n"
             )
@@ -585,14 +594,34 @@ def run_pipeline(
 
                 # Check deduplication against Simkl library
                 is_already_in_simkl = False
-                for tid in (target_imdb, tmdb_id, tvdb_id):
-                    if tid and str(tid) in simkl_existing_ids:
-                        is_already_in_simkl = True
-                        break
+                if is_tv or season:
+                    eff_season = season or 1
+                    candidate_ids = [series_imdb_id, imdb_id, tmdb_id, tvdb_id]
+                    for cid in candidate_ids:
+                        if cid:
+                            cid_str = str(cid).lower().strip()
+                            if (cid_str, eff_season) in simkl_show_seasons:
+                                is_already_in_simkl = True
+                                break
+                            if cid_str in simkl_completed_shows:
+                                is_already_in_simkl = True
+                                break
+                            if status in ("mark", "doing") and cid_str in simkl_show_ids:
+                                is_already_in_simkl = True
+                                break
+                else:
+                    candidate_ids = [imdb_id, tmdb_id]
+                    for cid in candidate_ids:
+                        if cid and str(cid).lower().strip() in simkl_movie_ids:
+                            is_already_in_simkl = True
+                            break
 
                 if is_already_in_simkl or cached_sync_status == "synced":
                     already_in_simkl_count += 1
                     record_sync_status = "already_synced"
+                    if is_already_in_simkl and cached_sync_status != "synced":
+                        # Item is present in Simkl; resolve any stale error status from previous runs
+                        storage.mark_synced(douban_id, "synced")
                 elif not ids_dict:
                     unresolved_count += 1
                     record_sync_status = "unresolved_no_id"
@@ -706,8 +735,58 @@ def run_pipeline(
         did = rec.get("douban_id")
         if did:
             final_status = storage.get_sync_status(did)
-            if final_status:
+            if final_status and final_status.startswith("error:"):
                 rec["simkl_sync_status"] = final_status
+            elif rec.get("simkl_sync_status") not in ("already_synced", "unresolved_no_id"):
+                if final_status:
+                    rec["simkl_sync_status"] = final_status
+
+    # Aggregate any items with error status into failed_sync_items for complete reporting
+    existing_failed_dids = {str(f.get("douban_id")) for f in failed_sync_items if f.get("douban_id")}
+    for rec in enriched_records:
+        did = str(rec.get("douban_id", ""))
+        st = str(rec.get("simkl_sync_status", ""))
+        if st.startswith("error:") and did not in existing_failed_dids:
+            err_reason = st[7:].strip() if st.startswith("error:") else st
+            target_st = "history (watched)" if rec.get("status") == "done" else "watchlist"
+            failed_sync_items.append({
+                "douban_id": did,
+                "title": rec.get("title"),
+                "year": rec.get("year"),
+                "type": rec.get("type"),
+                "status": rec.get("status"),
+                "target_status": target_st,
+                "ids": {
+                    "imdb": rec.get("series_imdb_id") or rec.get("imdb_id"),
+                    "tmdb": rec.get("tmdb_id"),
+                    "tvdb": rec.get("tvdb_id"),
+                },
+                "error": err_reason,
+            })
+            existing_failed_dids.add(did)
+
+    for db_fail in storage.get_failed_sync_records():
+        did = str(db_fail.get("douban_id", ""))
+        if did not in existing_failed_dids:
+            st = str(db_fail.get("status", ""))
+            err_reason = st[7:].strip() if st.startswith("error:") else st
+            failed_sync_items.append({
+                "douban_id": did,
+                "title": db_fail.get("title"),
+                "year": "-",
+                "type": "tv" if db_fail.get("season") else "movie",
+                "status": "done",
+                "target_status": "history (watched)",
+                "ids": {
+                    "imdb": db_fail.get("series_imdb_id") or db_fail.get("imdb_id"),
+                    "tmdb": db_fail.get("tmdb_id"),
+                    "tvdb": db_fail.get("tvdb_id"),
+                },
+                "error": err_reason,
+            })
+            existing_failed_dids.add(did)
+
+    simkl_errors_count = len(failed_sync_items)
 
     export_full_backup(enriched_records, "douban_full_backup.jsonl")
     if long_reviews:

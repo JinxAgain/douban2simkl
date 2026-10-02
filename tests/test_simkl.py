@@ -72,6 +72,49 @@ def test_get_existing_library_ids():
         assert "79168" in ids
 
 
+def test_get_existing_library_data():
+    client = SimklClient(client_id="test_client_id", access_token="mock_token")
+
+    movies_resp = MagicMock()
+    movies_resp.status_code = 200
+    movies_resp.json.return_value = {
+        "movies": [
+            {"movie": {"title": "Shawshank", "ids": {"imdb": "tt0111161", "tmdb": 278}}}
+        ]
+    }
+
+    shows_resp = MagicMock()
+    shows_resp.status_code = 200
+    shows_resp.json.return_value = {
+        "shows": [
+            {
+                "status": "completed",
+                "show": {"title": "Twin Peaks", "ids": {"imdb": "tt0098936", "tvdb": 70533}},
+                "seasons": [{"number": 1}, {"number": 2}, {"number": 3}],
+            },
+            {
+                "status": "watching",
+                "show": {"title": "Black Mirror", "ids": {"imdb": "tt2085059"}},
+                "seasons": [{"number": 1}],
+            },
+        ]
+    }
+
+    with patch.object(client.session, "get", side_effect=[movies_resp, shows_resp]):
+        data = client.get_existing_library_data()
+        assert "tt0111161" in data["movie_ids"]
+        assert "278" in data["movie_ids"]
+        assert "tt0098936" in data["show_ids"]
+        assert "tt0098936" in data["completed_shows"]
+        assert ("tt0098936", 1) in data["show_seasons"]
+        assert ("tt0098936", 2) in data["show_seasons"]
+        assert ("tt2085059", 1) in data["show_seasons"]
+        assert ("tt2085059", 2) not in data["show_seasons"]
+        assert "tt2085059" not in data["completed_shows"]
+        assert "tt0111161" in data["all_ids"]
+        assert "tt2085059" in data["all_ids"]
+
+
 def test_sync_history_batch():
     client = SimklClient(client_id="test_client_id", access_token="mock_token")
     mock_resp = MagicMock()
