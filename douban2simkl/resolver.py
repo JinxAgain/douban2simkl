@@ -2,7 +2,7 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import requests
 from douban2simkl.storage import Storage
 
@@ -105,25 +105,103 @@ def extract_season_number(title: str) -> Optional[int]:
     return None
 
 
-def is_strict_tmdb_match(candidate: Dict[str, Any], query_title: str, expected_year: Optional[Any]) -> bool:
-    """Strictly validate whether a TMDb search result exactly matches the title and year."""
+def normalize_title_token(t: str) -> str:
+    """Normalize a title token by removing all punctuation and whitespace, lowercase."""
+    return re.sub(r"[^\w\u4e00-\u9fa5]", "", (t or "").lower()).strip()
+
+
+def extract_title_variations(title: str) -> List[str]:
+    """Extract clean title variations from Douban title (stripping season, splitting bilingual/subtitles)."""
+    if not title:
+        return []
+
+    # 1. Clean season indicators
+    clean = re.sub(r"\s*第[一二两三四五六七八九十\d]+季.*", "", title, flags=re.I)
+    clean = re.sub(r"\s*Season\s*\d+.*", "", clean, flags=re.I)
+    clean = re.sub(r"\s*S\d{1,2}.*", "", clean, flags=re.I).strip()
+
+    variations: List[str] = [clean]
+
+    # 2. Split by common delimiters (e.g. "切尔诺贝利 / Chernobyl", "蝙蝠侠：黑暗骑士")
+    for part in re.split(r"[/|:：—–-]", clean):
+        p = part.strip()
+        if p and len(p) >= 2:
+            variations.append(p)
+
+    # 3. Separate mixed CJK and Latin if any (e.g. "爱在黎明破晓前 Before Sunrise")
+    cjk_tokens = re.findall(r"[\u4e00-\u9fa5]+", clean)
+    latin_tokens = re.findall(r"[A-Za-z0-9]+", clean)
+    cjk_part = "".join(cjk_tokens).strip()
+    latin_part = " ".join(latin_tokens).strip()
+    if cjk_part and len(cjk_part) >= 2:
+        variations.append(cjk_part)
+    if latin_part and len(latin_part) >= 2:
+        variations.append(latin_part)
+
+    return list(dict.fromkeys(v for v in variations if v.strip()))
+
+
+def is_strict_title_match(query_title: str, candidate_title: str) -> bool:
+    """Validate whether candidate_title matches query_title or any of its clean components."""
+    if not query_title or not candidate_title:
+        return False
+
+    norm_cand = normalize_title_token(candidate_title)
+    if not norm_cand:
+        return False
+
+    variations = extract_title_variations(query_title)
+    for v in variations:
+        norm_v = normalize_title_token(v)
+        if norm_v and norm_v == norm_cand:
+            return True
+
+    return False
+
+
+def is_strict_tmdb_match(
+    candidate: Dict[str, Any],
+    query_title: str,
+    expected_year: Optional[Any] = None,
+    is_tv: bool = False,
+    season: Optional[int] = None,
+) -> bool:
+    """Strictly validate whether a TMDb search result matches media type, title, and release year."""
     if not candidate or not query_title:
         return False
 
-    cand_title = (candidate.get("title") or candidate.get("name") or "").strip().lower()
-    cand_orig_title = (candidate.get("original_title") or candidate.get("original_name") or "").strip().lower()
-    clean_query = query_title.strip().lower()
+    # 1. MediaType validation
+    cand_media_type = candidate.get("media_type")
+    if is_tv:
+        if cand_media_type and cand_media_type == "movie":
+            return False
+        # If candidate has release_date and title but no name/first_air_date, it's a movie
+        if "release_date" in candidate and "first_air_date" not in candidate and "name" not in candidate:
+            return False
+    else:
+        if cand_media_type and cand_media_type == "tv":
+            return False
+        # If candidate has first_air_date and name but no release_date/title, it's a TV show
+        if "first_air_date" in candidate and "release_date" not in candidate and "title" not in candidate:
+            return False
 
-    # Normalize punctuation and whitespace for both Chinese and English titles
-    norm_query = re.sub(r"[^\w\u4e00-\u9fa5]", "", clean_query)
-    norm_title = re.sub(r"[^\w\u4e00-\u9fa5]", "", cand_title)
-    norm_orig = re.sub(r"[^\w\u4e00-\u9fa5]", "", cand_orig_title)
+    # 2. Title validation across localized and original titles
+    cand_titles = [
+        candidate.get("title"),
+        candidate.get("name"),
+        candidate.get("original_title"),
+        candidate.get("original_name"),
+    ]
+    title_matched = False
+    for ct in cand_titles:
+        if ct and is_strict_title_match(query_title, ct):
+            title_matched = True
+            break
 
-    # Title must exactly match either the localized title or original title
-    if norm_query != norm_title and norm_query != norm_orig:
+    if not title_matched:
         return False
 
-    # Year must match within +-1 year if year is known
+    # 3. Year validation
     if expected_year:
         try:
             exp_y = int(str(expected_year).strip()[:4])
@@ -131,8 +209,15 @@ def is_strict_tmdb_match(candidate: Dict[str, Any], query_title: str, expected_y
             cand_year_str = release_date[:4]
             if cand_year_str.isdigit():
                 cand_y = int(cand_year_str)
-                if abs(cand_y - exp_y) > 1:
-                    return False
+                eff_season = season or extract_season_number(query_title)
+                if is_tv and eff_season and eff_season > 1:
+                    # For Season > 1, the series first air date cannot be later than the season release year (+1 margin)
+                    if cand_y > exp_y + 1:
+                        return False
+                else:
+                    # For movie or Season 1, release year must match within +-1 year
+                    if abs(cand_y - exp_y) > 1:
+                        return False
         except (ValueError, TypeError):
             pass
 
@@ -382,13 +467,17 @@ class ItemResolver:
                 resp = self.session.get(find_url, timeout=10)
                 if resp.status_code == 200:
                     data = resp.json()
+                    seasons = data.get("tv_season_results", [])
                     episodes = data.get("tv_episode_results", [])
                     tv_results = data.get("tv_results", [])
                     show_id = None
-                    if episodes and "show_id" in episodes[0]:
+                    if seasons and "show_id" in seasons[0]:
+                        show_id = seasons[0]["show_id"]
+                    elif episodes and "show_id" in episodes[0]:
                         show_id = episodes[0]["show_id"]
                     elif tv_results and "id" in tv_results[0]:
                         show_id = tv_results[0]["id"]
+
 
                     if show_id:
                         result["tmdb_id"] = str(show_id)
@@ -487,9 +576,10 @@ class ItemResolver:
             "query": clean_title or title,
             "language": "zh-CN",
         }
-        if year:
+        season = extract_season_number(title)
+        if year and (not is_tv or not season or season == 1):
             param_key = "first_air_date_year" if is_tv else "primary_release_year"
-            params[param_key] = str(year)
+            params[param_key] = str(year)[:4]
 
         try:
             resp = self.session.get(url, params=params, timeout=10)
@@ -497,7 +587,13 @@ class ItemResolver:
                 results = resp.json().get("results", [])
                 matched_cand = None
                 for cand in results:
-                    if is_strict_tmdb_match(cand, clean_title or title, year):
+                    if is_strict_tmdb_match(
+                        cand,
+                        query_title=clean_title or title,
+                        expected_year=year,
+                        is_tv=is_tv,
+                        season=season,
+                    ):
                         matched_cand = cand
                         break
 
@@ -514,9 +610,10 @@ class ItemResolver:
                             result["tvdb_id"] = str(ext_data["tvdb_id"])
                 else:
                     logger.debug(
-                        "TMDb search for '%s' (%s) rejected: no candidate strictly matched title & year.",
+                        "TMDb search for '%s' (%s, is_tv=%s) rejected: no candidate strictly matched title, media type & year.",
                         title,
                         year,
+                        is_tv,
                     )
         except Exception as e:
             logger.debug("TMDb search failed for '%s': %s", title, e)
@@ -527,37 +624,114 @@ class ItemResolver:
         self,
         title: str,
         year: Optional[Any] = None,
+        is_tv: bool = False,
         omdb_api_key: Optional[str] = None,
     ) -> Optional[str]:
-        """Search OMDb by title and year to find IMDb ID with strict title/year validation."""
+        """Search OMDb by title and year to find IMDb ID with strict title/year/media-type validation."""
         if not omdb_api_key or not title:
             return None
         clean_title = re.sub(r"第[一二两三四五六七八九十\d]+季", "", title).strip()
         url = "http://www.omdbapi.com/"
-        params: Dict[str, Any] = {"apikey": omdb_api_key, "t": clean_title or title}
-        if year:
-            params["y"] = str(year)
+        params: Dict[str, Any] = {
+            "apikey": omdb_api_key,
+            "t": clean_title or title,
+            "type": "series" if is_tv else "movie",
+        }
+        season = extract_season_number(title)
+        if year and (not is_tv or not season or season == 1):
+            params["y"] = str(year)[:4]
         try:
             resp = self.session.get(url, params=params, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
+                if data.get("Response") != "True":
+                    return None
+
+                # 1. Strict MediaType validation
+                cand_type = (data.get("Type") or "").lower()
+                if is_tv and cand_type not in ("series", "mini-series", "tv"):
+                    logger.debug("OMDb search for '%s' rejected: expected series, got %s", title, cand_type)
+                    return None
+                if not is_tv and cand_type not in ("movie", "feature"):
+                    logger.debug("OMDb search for '%s' rejected: expected movie, got %s", title, cand_type)
+                    return None
+
+                # 2. Strict Title validation
                 omdb_title = data.get("Title", "")
+                if not is_strict_title_match(clean_title or title, omdb_title):
+                    logger.debug("OMDb search for '%s' rejected: title '%s' did not match", title, omdb_title)
+                    return None
+
+                # 3. Strict Year validation
                 omdb_year = data.get("Year", "")
-                norm_q = re.sub(r"[^\w\u4e00-\u9fa5]", "", (clean_title or title).lower())
-                norm_o = re.sub(r"[^\w\u4e00-\u9fa5]", "", omdb_title.lower())
-                if norm_q and norm_q == norm_o:
-                    if year and omdb_year and omdb_year[:4].isdigit():
-                        try:
-                            if abs(int(omdb_year[:4]) - int(str(year)[:4])) > 1:
+                if year and omdb_year and omdb_year[:4].isdigit():
+                    try:
+                        exp_y = int(str(year)[:4])
+                        cand_y = int(omdb_year[:4])
+                        if is_tv and season and season > 1:
+                            if cand_y > exp_y + 1:
+                                logger.debug(
+                                    "OMDb search for '%s' rejected: TV air year %d > season year %d",
+                                    title,
+                                    cand_y,
+                                    exp_y,
+                                )
                                 return None
-                        except (ValueError, TypeError):
-                            pass
-                    imdb_id = data.get("imdbID")
-                    if imdb_id and imdb_id.startswith("tt"):
-                        return imdb_id
+                        else:
+                            if abs(cand_y - exp_y) > 1:
+                                logger.debug(
+                                    "OMDb search for '%s' rejected: year mismatch %d vs %d",
+                                    title,
+                                    cand_y,
+                                    exp_y,
+                                )
+                                return None
+                    except (ValueError, TypeError):
+                        pass
+
+                imdb_id = data.get("imdbID")
+                if imdb_id and imdb_id.startswith("tt"):
+                    return imdb_id
         except Exception as e:
             logger.debug("OMDb search failed for '%s': %s", title, e)
         return None
+
+    def _find_sibling_series_ids(
+        self, title: str, current_douban_id: str
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """Look up parent series IDs (series_imdb_id, tmdb_id, tvdb_id) from sibling seasons in local storage."""
+        if not self.storage or not title:
+            return None, None, None
+
+        clean_base_title = re.sub(r"\s*第[一二两三四五六七八九十\d]+季.*", "", title).strip()
+        if not clean_base_title or len(clean_base_title) < 2:
+            return None, None, None
+
+        try:
+            with self.storage._get_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT imdb_id, series_imdb_id, tmdb_id, tvdb_id, season
+                    FROM imdb_cache
+                    WHERE (title LIKE ? OR title LIKE ?) AND douban_id != ?
+                    ORDER BY (series_imdb_id IS NOT NULL) DESC, season ASC
+                    """,
+                    (f"{clean_base_title}%", f"%{clean_base_title}%", str(current_douban_id)),
+                ).fetchall()
+                for r in rows:
+                    s_series = r["series_imdb_id"]
+                    s_imdb = r["imdb_id"]
+                    s_season = r["season"]
+                    s_tmdb = r["tmdb_id"]
+                    s_tvdb = r["tvdb_id"]
+                    if s_series:
+                        return s_series, s_tmdb, s_tvdb
+                    elif s_season == 1 and s_imdb:
+                        return s_imdb, s_tmdb, s_tvdb
+        except Exception as e:
+            logger.debug("Sibling series lookup failed for '%s': %s", title, e)
+
+        return None, None, None
 
     def resolve_item(
         self,
@@ -593,15 +767,57 @@ class ItemResolver:
                         tmdb_id = tmdb_id or s_meta.get("tmdb_id")
                         tvdb_id = tvdb_id or s_meta.get("tvdb_id")
 
-                        self.storage.save_imdb_mapping(
-                            douban_id=douban_id,
-                            imdb_id=imdb_id,
-                            series_imdb_id=series_imdb_id,
-                            season=cached_season,
-                            title=title,
-                            tmdb_id=tmdb_id,
-                            tvdb_id=tvdb_id,
+                    # Fallback A: TMDb search by clean title if still missing
+                    if not series_imdb_id and tmdb_api_key and (title or cached.get("title")):
+                        clean_base = re.sub(
+                            r"\s*第[一二两三四五六七八九十\d]+季.*", "", title or cached.get("title", "")
+                        ).strip()
+                        if clean_base:
+                            tmdb_search = self.search_tmdb_title(clean_base, is_tv=True, tmdb_api_key=tmdb_api_key)
+                            series_imdb_id = tmdb_search.get("imdb_id")
+                            tmdb_id = tmdb_id or tmdb_search.get("tmdb_id")
+                            tvdb_id = tvdb_id or tmdb_search.get("tvdb_id")
+
+                    # Fallback B: Cross-season sibling inheritance from local cache
+                    if not series_imdb_id and self.storage and (title or cached.get("title")):
+                        sib_series, sib_tmdb, sib_tvdb = self._find_sibling_series_ids(
+                            title or cached.get("title", ""), douban_id
                         )
+                        if sib_series:
+                            series_imdb_id = sib_series
+                            tmdb_id = tmdb_id or sib_tmdb
+                            tvdb_id = tvdb_id or sib_tvdb
+
+                    self.storage.save_imdb_mapping(
+                        douban_id=douban_id,
+                        imdb_id=imdb_id,
+                        series_imdb_id=series_imdb_id,
+                        season=cached_season,
+                        title=title or cached.get("title"),
+                        tmdb_id=tmdb_id,
+                        tvdb_id=tvdb_id,
+                    )
+
+                # For TV shows, if tmdb_id is still missing and tmdb_api_key is available, look up TMDb by clean title
+                if is_series and tmdb_api_key and not tmdb_id and (title or cached.get("title")):
+                    clean_base = re.sub(
+                        r"\s*第[一二两三四五六七八九十\d]+季.*", "", title or cached.get("title", "")
+                    ).strip()
+                    if clean_base:
+                        tmdb_search = self.search_tmdb_title(clean_base, is_tv=True, tmdb_api_key=tmdb_api_key)
+                        if tmdb_search.get("tmdb_id"):
+                            tmdb_id = tmdb_search.get("tmdb_id")
+                            tvdb_id = tvdb_id or tmdb_search.get("tvdb_id")
+                            self.storage.save_imdb_mapping(
+                                douban_id=douban_id,
+                                imdb_id=imdb_id,
+                                series_imdb_id=series_imdb_id,
+                                season=cached_season,
+                                title=title or cached.get("title"),
+                                tmdb_id=tmdb_id,
+                                tvdb_id=tvdb_id,
+                            )
+
                 return {
                     "douban_id": douban_id,
                     "imdb_id": imdb_id,
@@ -611,6 +827,7 @@ class ItemResolver:
                     "season": cached_season,
                     "title": title or cached.get("title"),
                 }
+
 
         imdb_id = None
         tmdb_id = None
@@ -651,7 +868,9 @@ class ItemResolver:
         # 5. Fallback: OMDb search by title + year if API key provided and no IMDb found
         if omdb_api_key and not imdb_id:
             try:
-                imdb_id = self.search_omdb_title(title=title, year=year, omdb_api_key=omdb_api_key)
+                imdb_id = self.search_omdb_title(
+                    title=title, year=year, is_tv=is_series, omdb_api_key=omdb_api_key
+                )
             except Exception as e:
                 logger.debug("OMDb search fallback failed for %s: %s", title, e)
 
@@ -665,6 +884,38 @@ class ItemResolver:
                 series_imdb_id = s_meta.get("series_imdb_id")
                 tmdb_id = tmdb_id or s_meta.get("tmdb_id")
                 tvdb_id = tvdb_id or s_meta.get("tvdb_id")
+
+            # Fallback A: TMDb search by clean title if still missing
+            if not series_imdb_id and tmdb_api_key and title:
+                clean_base = re.sub(
+                    r"\s*第[一二两三四五六七八九十\d]+季.*", "", title
+                ).strip()
+                if clean_base:
+                    tmdb_search = self.search_tmdb_title(clean_base, is_tv=True, tmdb_api_key=tmdb_api_key)
+                    series_imdb_id = tmdb_search.get("imdb_id")
+                    tmdb_id = tmdb_id or tmdb_search.get("tmdb_id")
+                    tvdb_id = tvdb_id or tmdb_search.get("tvdb_id")
+
+            # Fallback B: Cross-season sibling inheritance from local cache
+            if not series_imdb_id and self.storage and title:
+                sib_series, sib_tmdb, sib_tvdb = self._find_sibling_series_ids(
+                    title, douban_id
+                )
+                if sib_series:
+                    series_imdb_id = sib_series
+                    tmdb_id = tmdb_id or sib_tmdb
+                    tvdb_id = tvdb_id or sib_tvdb
+
+        # For TV shows, if tmdb_id is still missing and tmdb_api_key is available, look up TMDb by clean title
+        if is_series and tmdb_api_key and not tmdb_id and title:
+            clean_base = re.sub(
+                r"\s*第[一二两三四五六七八九十\d]+季.*", "", title
+            ).strip()
+            if clean_base:
+                tmdb_search = self.search_tmdb_title(clean_base, is_tv=True, tmdb_api_key=tmdb_api_key)
+                if tmdb_search.get("tmdb_id"):
+                    tmdb_id = tmdb_search.get("tmdb_id")
+                    tvdb_id = tvdb_id or tmdb_search.get("tvdb_id")
 
         result = {
             "douban_id": douban_id,

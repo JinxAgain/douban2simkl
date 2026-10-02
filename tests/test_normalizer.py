@@ -86,3 +86,49 @@ def test_normalize_comment_length():
     assert len(text) == 140
     assert text.endswith("...")
     assert truncated is True
+
+
+def test_clean_comment_tag():
+    from douban2simkl.normalizer import clean_comment_tag
+
+    assert clean_comment_tag("[s01]: 剧情紧凑", 1) == "剧情紧凑"
+    assert clean_comment_tag("[S1] 精彩", 1) == "精彩"
+    assert clean_comment_tag("s02: 渐入佳境", 2) == "渐入佳境"
+    assert clean_comment_tag("第3季：神作", 3) == "神作"
+    assert clean_comment_tag("没有任何前缀的评论", 1) == "没有任何前缀的评论"
+    assert clean_comment_tag("", 1) == ""
+
+
+def test_build_composite_show_memo():
+    from douban2simkl.normalizer import build_composite_show_memo
+
+    # Empty dict
+    assert build_composite_show_memo({}) == ""
+    assert build_composite_show_memo({1: ""}) == ""
+
+    # Single season
+    single = build_composite_show_memo({1: "好看"})
+    assert single == "[s01]: 好看"
+
+    # Single season with existing tag stripped
+    single_tag = build_composite_show_memo({2: "[s02]: 精彩"})
+    assert single_tag == "[s02]: 精彩"
+
+    # Multiple seasons fitting in 140 chars
+    multi = build_composite_show_memo({
+        1: "节奏真快",
+        2: "复刻社交网络",
+        4: "封神之作",
+    })
+    assert multi == "[s01]: 节奏真快 ; [s02]: 复刻社交网络 ; [s04]: 封神之作"
+
+    # Long comments budget and truncation
+    long_multi = build_composite_show_memo({
+        1: "A" * 80,
+        2: "B" * 80,
+    })
+    assert len(long_multi) <= 140
+    assert "[s01]: " in long_multi
+    assert "[s02]: " in long_multi
+    assert " ; " in long_multi
+

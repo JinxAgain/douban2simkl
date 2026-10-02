@@ -220,11 +220,102 @@ def test_search_omdb_title_fallback():
 
     search_resp = MagicMock()
     search_resp.status_code = 200
-    search_resp.json.return_value = {"Title": "Fight Club", "Year": "1999", "imdbID": "tt0137523", "Response": "True"}
+    search_resp.json.return_value = {
+        "Title": "Fight Club",
+        "Year": "1999",
+        "imdbID": "tt0137523",
+        "Type": "movie",
+        "Response": "True",
+    }
 
     with patch.object(resolver.session, "get", return_value=search_resp):
         imdb_id = resolver.search_omdb_title("Fight Club", year=1999, omdb_api_key="fake_key")
         assert imdb_id == "tt0137523"
+
+
+def test_search_omdb_rejects_media_type_mismatch():
+    resolver = ItemResolver(storage=None)
+
+    search_resp = MagicMock()
+    search_resp.status_code = 200
+    # OMDb returns a movie, but caller requested a TV series
+    search_resp.json.return_value = {
+        "Title": "Sherlock Holmes",
+        "Year": "2010",
+        "imdbID": "tt1475582",
+        "Type": "movie",
+        "Response": "True",
+    }
+
+    with patch.object(resolver.session, "get", return_value=search_resp):
+        imdb_id = resolver.search_omdb_title("Sherlock Holmes", year=2010, is_tv=True, omdb_api_key="fake_key")
+        assert imdb_id is None
+
+
+def test_search_tmdb_title_bilingual_and_clean_title():
+    resolver = ItemResolver(storage=None)
+
+    search_resp = MagicMock()
+    search_resp.status_code = 200
+    search_resp.json.return_value = {
+        "results": [{
+            "id": 76,
+            "title": "爱在黎明破晓前",
+            "original_title": "Before Sunrise",
+            "release_date": "1995-01-27",
+        }]
+    }
+
+    ext_resp = MagicMock()
+    ext_resp.status_code = 200
+    ext_resp.json.return_value = {"imdb_id": "tt0112471", "tvdb_id": None}
+
+    with patch.object(resolver.session, "get", side_effect=[search_resp, ext_resp]):
+        res = resolver.search_tmdb_title("爱在黎明破晓前 Before Sunrise", year=1995, tmdb_api_key="fake_key")
+        assert res["tmdb_id"] == "76"
+        assert res["imdb_id"] == "tt0112471"
+
+
+def test_is_strict_tmdb_match_tv_season_air_date():
+    from douban2simkl.resolver import is_strict_tmdb_match
+
+    cand_valid = {
+        "name": "行业",
+        "original_name": "Industry",
+        "first_air_date": "2020-11-09",
+    }
+    # Season 2 (2022) with parent series first air date 2020: valid
+    assert is_strict_tmdb_match(cand_valid, "行业 第二季", expected_year=2022, is_tv=True, season=2)
+
+    cand_future = {
+        "name": "行业",
+        "original_name": "Industry",
+        "first_air_date": "2025-01-01",
+    }
+    # Series first air date in 2025 cannot be parent of a 2022 season: rejected
+    assert not is_strict_tmdb_match(cand_future, "行业 第二季", expected_year=2022, is_tv=True, season=2)
+
+
+def test_is_strict_tmdb_match_media_type_rejection():
+    from douban2simkl.resolver import is_strict_tmdb_match
+
+    # Searching for TV series, but candidate is a movie
+    cand_movie = {
+        "title": "流人",
+        "original_title": "Slow Horses",
+        "media_type": "movie",
+        "release_date": "2022-04-01",
+    }
+    assert not is_strict_tmdb_match(cand_movie, "流人", is_tv=True)
+
+    # Searching for movie, but candidate is a TV show
+    cand_tv = {
+        "name": "流人",
+        "original_name": "Slow Horses",
+        "media_type": "tv",
+        "first_air_date": "2022-04-01",
+    }
+    assert not is_strict_tmdb_match(cand_tv, "流人", is_tv=False)
 
 
 def test_fetch_neodb_ids_with_tmdb_tvdb():
@@ -245,5 +336,57 @@ def test_fetch_neodb_ids_with_tmdb_tvdb():
         assert ids["imdb_id"] == "tt13972272"
         assert ids["tmdb_id"] == "117954"
         assert ids["tvdb_id"] == "396612"
+
+
+def test_resolve_series_metadata_tmdb_tv_season_results():
+    resolver = ItemResolver(storage=None)
+
+    find_resp = MagicMock()
+    find_resp.status_code = 200
+    find_resp.json.return_value = {
+        "tv_season_results": [{"show_id": 90812, "season_number": 2}]
+    }
+
+    ext_resp = MagicMock()
+    ext_resp.status_code = 200
+    ext_resp.json.return_value = {"imdb_id": "tt10830612", "tvdb_id": 361735}
+
+    with patch.object(resolver.session, "get", side_effect=[find_resp, ext_resp]):
+        meta = resolver.resolve_series_metadata("tt15049514", tmdb_api_key="fake_key")
+        assert meta["series_imdb_id"] == "tt10830612"
+        assert meta["tmdb_id"] == "90812"
+        assert meta["tvdb_id"] == "361735"
+
+
+def test_sibling_series_inheritance():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage = Storage(os.path.join(tmpdir, "cache.db"))
+        resolver = ItemResolver(storage=storage)
+
+        # Pre-seed Season 1 with series_imdb_id in cache
+        storage.save_imdb_mapping(
+            douban_id="30228394",
+            imdb_id="tt10830612",
+            series_imdb_id="tt10830612",
+            season=1,
+            title="行业 第一季",
+            tmdb_id="90812",
+            tvdb_id="361735",
+        )
+
+        # Pre-seed Season 2 without series_imdb_id
+        storage.save_imdb_mapping(
+            douban_id="35265497",
+            imdb_id="tt15049514",
+            series_imdb_id=None,
+            season=2,
+            title="行业 第二季",
+        )
+
+        # Resolving Season 2 with no external API keys should inherit from Season 1
+        res = resolver.resolve_item("35265497", "行业 第二季")
+        assert res["series_imdb_id"] == "tt10830612"
+        assert res["tmdb_id"] == "90812"
+        assert res["tvdb_id"] == "361735"
 
 

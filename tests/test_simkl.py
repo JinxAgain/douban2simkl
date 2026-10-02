@@ -90,12 +90,13 @@ def test_get_existing_library_data():
             {
                 "status": "completed",
                 "show": {"title": "Twin Peaks", "ids": {"imdb": "tt0098936", "tvdb": 70533}},
+                "memo": {"text": "[s01]: Great ; [s02]: Classic"},
                 "seasons": [{"number": 1}, {"number": 2}, {"number": 3}],
             },
             {
                 "status": "watching",
                 "show": {"title": "Black Mirror", "ids": {"imdb": "tt2085059"}},
-                "seasons": [{"number": 1}],
+                "seasons": [{"number": 1, "episodes": [{"number": 1}]}],
             },
         ]
     }
@@ -111,8 +112,54 @@ def test_get_existing_library_data():
         assert ("tt2085059", 1) in data["show_seasons"]
         assert ("tt2085059", 2) not in data["show_seasons"]
         assert "tt2085059" not in data["completed_shows"]
+        assert data["show_memos"].get("tt0098936") == "[s01]: Great ; [s02]: Classic"
         assert "tt0111161" in data["all_ids"]
         assert "tt2085059" in data["all_ids"]
+
+
+
+def test_is_season_fully_watched_and_partial_seasons():
+    client = SimklClient(client_id="test_client_id", access_token="mock_token")
+
+    # 1. Completed show -> always True
+    completed_show = {"status": "completed", "seasons": [{"number": 1}]}
+    assert client.is_season_fully_watched(completed_show, 1) is True
+
+    # 2. Show where next_to_watch points to this season -> False
+    partial_next_watch = {
+        "status": "watching",
+        "next_to_watch": "S04E03",
+        "seasons": [{"number": 4, "episodes": [{"number": 1}, {"number": 2}, {"number": 4}]}],
+    }
+    assert client.is_season_fully_watched(partial_next_watch, 4) is False
+
+    # 3. Show with gaps in episodes -> False
+    partial_gap = {
+        "status": "watching",
+        "next_to_watch": "S05E01",
+        "seasons": [{"number": 4, "episodes": [{"number": 1}, {"number": 2}, {"number": 4}]}],
+    }
+    assert client.is_season_fully_watched(partial_gap, 4) is False
+
+    # 4. Show where episodes match total count from get_show_season_episode_counts -> True
+    full_season = {
+        "status": "watching",
+        "next_to_watch": "S04E01",
+        "show": {"ids": {"simkl": 1254370}},
+        "seasons": [{"number": 1, "episodes": [{"number": 1}, {"number": 2}, {"number": 3}]}],
+    }
+    with patch.object(client, "get_show_season_episode_counts", return_value={1: 3, 2: 6}):
+        assert client.is_season_fully_watched(full_season, 1) is True
+
+    # 5. Show where watched count is less than total count -> False
+    partial_count = {
+        "status": "watching",
+        "next_to_watch": None,
+        "show": {"ids": {"simkl": 1254370}},
+        "seasons": [{"number": 2, "episodes": [{"number": 1}, {"number": 2}]}],
+    }
+    with patch.object(client, "get_show_season_episode_counts", return_value={1: 3, 2: 6}):
+        assert client.is_season_fully_watched(partial_count, 2) is False
 
 
 def test_sync_history_batch():

@@ -110,6 +110,73 @@ class SimklClient:
                 return token
         return None
 
+    def get_show_season_episode_counts(self, simkl_id: int) -> Dict[int, int]:
+        """Fetch total episode count for each season of a TV show using Simkl's episode catalog."""
+        if not hasattr(self, "_season_counts_cache"):
+            self._season_counts_cache: Dict[int, Dict[int, int]] = {}
+
+        if simkl_id in self._season_counts_cache:
+            return self._season_counts_cache[simkl_id]
+
+        counts: Dict[int, int] = {}
+        try:
+            url = f"{SIMKL_API_BASE}/tv/episodes/{simkl_id}"
+            resp = self.session.get(url, timeout=15)
+            if resp.status_code == 200:
+                episodes = resp.json()
+                if isinstance(episodes, list):
+                    for ep in episodes:
+                        sn = ep.get("season")
+                        if sn is not None:
+                            counts[sn] = counts.get(sn, 0) + 1
+        except Exception as e:
+            logger.warning("Failed to fetch episode counts for Simkl show %s: %s", simkl_id, e)
+
+        self._season_counts_cache[simkl_id] = counts
+        return counts
+
+    def is_season_fully_watched(self, show_data: Dict[str, Any], season_number: int) -> bool:
+        """Determine if a season is 100% fully watched in user's Simkl library.
+
+        Returns False if only partial episodes of the season have been watched,
+        allowing the full season to be synced and marked as completely watched.
+        """
+        st = str(show_data.get("status", "")).lower()
+        if st == "completed":
+            return True
+
+        seasons = show_data.get("seasons", [])
+        season_obj = next((s for s in seasons if s.get("number") == season_number), None)
+        if not season_obj:
+            return False
+
+        watched_episodes = season_obj.get("episodes", [])
+        if not watched_episodes:
+            return False
+
+        watched_count = len(watched_episodes)
+
+        # 1. Quick check: if next_to_watch is in this season (indicates season in progress)
+        next_to_watch = str(show_data.get("next_to_watch", "")).upper()
+        if next_to_watch.startswith(f"S{season_number:02d}") or next_to_watch.startswith(f"S{season_number}E"):
+            return False
+
+        # 2. Quick check: if episode numbers have gaps (e.g. [1, 2, 4]), it is incomplete
+        ep_numbers = [e.get("number") for e in watched_episodes if e.get("number") is not None]
+        if ep_numbers and max(ep_numbers) > watched_count:
+            return False
+
+        # 3. Query total episodes count from Simkl episode catalog
+        show_info = show_data.get("show") or show_data
+        simkl_id = show_info.get("ids", {}).get("simkl")
+        if simkl_id:
+            totals = self.get_show_season_episode_counts(int(simkl_id))
+            total_count = totals.get(season_number)
+            if total_count is not None and total_count > 0:
+                return watched_count >= total_count
+
+        return True
+
     def get_existing_library_data(self) -> Dict[str, Any]:
         """Fetch detailed existing library data distinguishing movies, shows, and individual seasons.
 
@@ -117,7 +184,7 @@ class SimklClient:
             Dict containing:
                 - 'movie_ids': Set[str] of all movie IDs (IMDb, TMDb, Simkl IDs in lowercase)
                 - 'show_ids': Set[str] of all show root IDs in lowercase
-                - 'show_seasons': Set[Tuple[str, int]] of (show_id_lowercase, season_number)
+                - 'show_seasons': Set[Tuple[str, int]] of (show_id_lowercase, season_number) for fully watched seasons
                 - 'completed_shows': Set[str] of show IDs marked as completed
                 - 'all_ids': Set[str] of all media IDs (union of movie and show IDs)
         """
@@ -145,12 +212,13 @@ class SimklClient:
         except Exception as e:
             logger.error("Error fetching Simkl movie library: %s", e)
 
-        # 2. Fetch shows with full season details
+        # 2. Fetch shows with full season details and memos
+        show_memos: Dict[str, str] = {}
         shows_url = f"{SIMKL_API_BASE}/sync/all-items/shows"
         try:
             resp = self.session.get(
                 shows_url,
-                params={"extended": "full", "include_all_episodes": "yes"},
+                params={"extended": "full", "include_all_episodes": "yes", "memos": "yes"},
                 timeout=30,
             )
             if resp.status_code == 200:
@@ -170,12 +238,25 @@ class SimklClient:
                             if st == "completed":
                                 completed_shows.add(v_str)
 
+                    # Extract existing show memo if available
+                    memo_obj = item.get("memo")
+                    memo_text = ""
+                    if isinstance(memo_obj, dict):
+                        memo_text = str(memo_obj.get("text") or "").strip()
+                    elif isinstance(memo_obj, str):
+                        memo_text = memo_obj.strip()
+                    if memo_text:
+                        for sid in current_show_ids:
+                            show_memos[sid] = memo_text
+
                     seasons = item.get("seasons", [])
                     for s in seasons:
                         s_num = s.get("number")
                         if s_num is not None:
-                            for sid in current_show_ids:
-                                show_seasons.add((sid, int(s_num)))
+                            # Only treat season as already in Simkl if it is 100% fully watched!
+                            if self.is_season_fully_watched(item, int(s_num)):
+                                for sid in current_show_ids:
+                                    show_seasons.add((sid, int(s_num)))
             else:
                 logger.warning("Failed to fetch show library from %s: HTTP %d", shows_url, resp.status_code)
         except Exception as e:
@@ -187,8 +268,10 @@ class SimklClient:
             "show_ids": show_ids,
             "show_seasons": show_seasons,
             "completed_shows": completed_shows,
+            "show_memos": show_memos,
             "all_ids": all_ids,
         }
+
 
     def get_existing_library_ids(self) -> Set[str]:
         """Fetch all existing movie and show IDs from user library for deduplication."""

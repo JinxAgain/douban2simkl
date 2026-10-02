@@ -144,9 +144,11 @@ def generate_sync_report(stats: Dict[str, Any], output_path: str = "sync_report.
 - **Already in Simkl (Skipped)**: {stats.get('already_in_simkl', 0)}
 - **New Items to Sync**: {stats.get('new_to_sync', 0)}
 - **Successfully Synced**: {stats.get('synced', 0)}
+- **TV Show Memos Updated**: {stats.get('memos_updated', 0)}
 - **Simkl API Errors**: {stats.get('simkl_errors', 0)}
 - **Unresolved IMDb**: {stats.get('unresolved', 0)}
 - **Long Reviews Archived (>140 chars)**: {stats.get('long_reviews_count', 0)}
+
 
 ## Files Generated
 
