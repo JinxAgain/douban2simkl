@@ -721,9 +721,12 @@ def run_pipeline(
                         s_key = plan["group"]
                         comp_memo = tv_composite_memos.get(s_key)
                         # Always scope to a single season: a show without "seasons" marks the WHOLE show
+                        season_obj: Dict[str, Any] = {"number": season}
+                        if watched_at_iso:
+                            season_obj["watched_at"] = watched_at_iso
                         show_obj: Dict[str, Any] = {
                             "ids": ids_dict,
-                            "seasons": [{"number": season}],
+                            "seasons": [season_obj],
                         }
                         if calibrated_rating:
                             show_obj["rating"] = calibrated_rating
