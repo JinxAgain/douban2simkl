@@ -724,8 +724,29 @@ def run_pipeline(
                         season_obj: Dict[str, Any] = {"number": season}
                         if watched_at_iso:
                             season_obj["watched_at"] = watched_at_iso
+
+                        # Fetch episode count for this season if possible (via TMDb or Simkl episode catalog)
+                        ep_count = None
+                        if config.TMDB_API_KEY and ids_dict.get("tmdb"):
+                            ep_count = resolver.get_season_episode_count(
+                                ids_dict["tmdb"], season, config.TMDB_API_KEY
+                            )
+                        if not ep_count and ids_dict.get("simkl"):
+                            try:
+                                counts = simkl_client.get_show_season_episode_counts(int(ids_dict["simkl"]))
+                                ep_count = counts.get(season)
+                            except Exception:
+                                pass
+
+                        if ep_count and ep_count > 0:
+                            season_obj["episodes"] = [
+                                {"number": ep_num, "watched_at": watched_at_iso}
+                                for ep_num in range(1, ep_count + 1)
+                            ]
+
                         show_obj: Dict[str, Any] = {
                             "ids": ids_dict,
+                            "use_tvdb_anime_seasons": True,
                             "seasons": [season_obj],
                         }
                         if calibrated_rating:

@@ -212,55 +212,56 @@ class SimklClient:
         except Exception as e:
             logger.error("Error fetching Simkl movie library: %s", e)
 
-        # 2. Fetch shows with full season details and memos
+        # 2. Fetch shows and anime with full season details and memos
         show_memos: Dict[str, str] = {}
-        shows_url = f"{SIMKL_API_BASE}/sync/all-items/shows"
-        try:
-            resp = self.session.get(
-                shows_url,
-                params={"extended": "full", "include_all_episodes": "yes", "memos": "yes"},
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data.get("shows", [])
-                for item in items:
-                    show_obj = item.get("show") or item
-                    ids_dict = show_obj.get("ids", {})
-                    st = str(item.get("status", "")).lower()
+        for endpoint_name in ("shows", "anime"):
+            endpoint_url = f"{SIMKL_API_BASE}/sync/all-items/{endpoint_name}"
+            try:
+                resp = self.session.get(
+                    endpoint_url,
+                    params={"extended": "full", "include_all_episodes": "yes", "memos": "yes"},
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = data.get(endpoint_name, [])
+                    for item in items:
+                        show_obj = item.get("show") or item.get("anime") or item
+                        ids_dict = show_obj.get("ids", {})
+                        st = str(item.get("status", "")).lower()
 
-                    current_show_ids: List[str] = []
-                    for val in ids_dict.values():
-                        if val:
-                            v_str = str(val).lower().strip()
-                            show_ids.add(v_str)
-                            current_show_ids.append(v_str)
-                            if st == "completed":
-                                completed_shows.add(v_str)
+                        current_show_ids: List[str] = []
+                        for val in ids_dict.values():
+                            if val:
+                                v_str = str(val).lower().strip()
+                                show_ids.add(v_str)
+                                current_show_ids.append(v_str)
+                                if st == "completed":
+                                    completed_shows.add(v_str)
 
-                    # Extract existing show memo if available
-                    memo_obj = item.get("memo")
-                    memo_text = ""
-                    if isinstance(memo_obj, dict):
-                        memo_text = str(memo_obj.get("text") or "").strip()
-                    elif isinstance(memo_obj, str):
-                        memo_text = memo_obj.strip()
-                    if memo_text:
-                        for sid in current_show_ids:
-                            show_memos[sid] = memo_text
+                        # Extract existing show memo if available
+                        memo_obj = item.get("memo")
+                        memo_text = ""
+                        if isinstance(memo_obj, dict):
+                            memo_text = str(memo_obj.get("text") or "").strip()
+                        elif isinstance(memo_obj, str):
+                            memo_text = memo_obj.strip()
+                        if memo_text:
+                            for sid in current_show_ids:
+                                show_memos[sid] = memo_text
 
-                    seasons = item.get("seasons", [])
-                    for s in seasons:
-                        s_num = s.get("number")
-                        if s_num is not None:
-                            # Only treat season as already in Simkl if it is 100% fully watched!
-                            if self.is_season_fully_watched(item, int(s_num)):
-                                for sid in current_show_ids:
-                                    show_seasons.add((sid, int(s_num)))
-            else:
-                logger.warning("Failed to fetch show library from %s: HTTP %d", shows_url, resp.status_code)
-        except Exception as e:
-            logger.error("Error fetching Simkl show library: %s", e)
+                        seasons = item.get("seasons", [])
+                        for s in seasons:
+                            s_num = s.get("number")
+                            if s_num is not None:
+                                # Only treat season as already in Simkl if it is 100% fully watched!
+                                if self.is_season_fully_watched(item, int(s_num)):
+                                    for sid in current_show_ids:
+                                        show_seasons.add((sid, int(s_num)))
+                else:
+                    logger.warning("Failed to fetch %s library from %s: HTTP %d", endpoint_name, endpoint_url, resp.status_code)
+            except Exception as e:
+                logger.error("Error fetching Simkl %s library: %s", endpoint_name, e)
 
         all_ids = movie_ids.union(show_ids)
         return {

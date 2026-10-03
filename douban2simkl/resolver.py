@@ -941,5 +941,39 @@ class ItemResolver:
 
         return result
 
+    def get_season_episode_count(
+        self, tmdb_id: str, season_number: int, tmdb_api_key: Optional[str] = None
+    ) -> Optional[int]:
+        """Fetch total episode count for a season from TMDb TV series catalog (cached)."""
+        if not hasattr(self, "_tmdb_season_episodes_cache"):
+            self._tmdb_season_episodes_cache: Dict[str, Dict[int, int]] = {}
+
+        tmdb_str = str(tmdb_id).strip()
+        if not tmdb_str:
+            return None
+
+        if tmdb_str in self._tmdb_season_episodes_cache:
+            return self._tmdb_season_episodes_cache[tmdb_str].get(season_number)
+
+        if not tmdb_api_key:
+            return None
+
+        counts: Dict[int, int] = {}
+        try:
+            url = f"https://api.themoviedb.org/3/tv/{tmdb_str}?api_key={tmdb_api_key}"
+            resp = self.session.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for s in data.get("seasons", []):
+                    sn = s.get("season_number")
+                    ec = s.get("episode_count")
+                    if sn is not None and ec is not None:
+                        counts[int(sn)] = int(ec)
+        except Exception as e:
+            logger.debug("Failed to fetch TMDb season episode counts for %s: %s", tmdb_str, e)
+
+        self._tmdb_season_episodes_cache[tmdb_str] = counts
+        return counts.get(season_number)
+
 
 DoubanResolver = ItemResolver

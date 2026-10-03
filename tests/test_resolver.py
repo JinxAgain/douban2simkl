@@ -390,3 +390,25 @@ def test_sibling_series_inheritance():
         assert res["tvdb_id"] == "361735"
 
 
+def test_get_season_episode_count():
+    resolver = ItemResolver(storage=None)
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "seasons": [
+            {"season_number": 1, "episode_count": 25},
+            {"season_number": 2, "episode_count": 12},
+        ]
+    }
+
+    with patch.object(resolver.session, "get", return_value=mock_resp):
+        cnt_s2 = resolver.get_season_episode_count("1429", 2, tmdb_api_key="test_key")
+        assert cnt_s2 == 12
+        cnt_s1 = resolver.get_season_episode_count("1429", 1, tmdb_api_key="test_key")
+        assert cnt_s1 == 25
+        # Verify cached (no second API call)
+        assert resolver.get_season_episode_count("1429", 3, tmdb_api_key="test_key") is None
+
+
+

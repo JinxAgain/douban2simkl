@@ -287,7 +287,13 @@ def test_cli_tv_watched_at_uses_douban_time_in_iso_utc(tmp_path):
     batches = _run_tv_pipeline(tmp_path, items, resolved, _empty_lib())
     show = batches[0]["shows"][0]
     # Douban timestamps are Beijing time (UTC+8); Simkl requires ISO-8601 UTC on both show and season.
-    assert show["seasons"] == [{"number": 8, "watched_at": "2017-11-28T16:08:15Z"}]
+    assert show["use_tvdb_anime_seasons"] is True
+    s_obj = show["seasons"][0]
+    assert s_obj["number"] == 8
+    assert s_obj["watched_at"] == "2017-11-28T16:08:15Z"
+    if "episodes" in s_obj:
+        for ep in s_obj["episodes"]:
+            assert ep["watched_at"] == "2017-11-28T16:08:15Z"
     assert show["watched_at"] == "2017-11-28T16:08:15Z"
 
 
@@ -331,6 +337,11 @@ def test_cli_tv_ambiguous_season_is_not_guessed_as_season_one(tmp_path):
     batches = _run_tv_pipeline(tmp_path, items, resolved, _empty_lib())
     shows = [s for b in batches for s in (b["shows"] or [])]
     assert len(shows) == 1
-    assert shows[0]["seasons"] == [{"number": 1, "watched_at": "2020-01-01T02:00:00Z"}]
+    s_obj = shows[0]["seasons"][0]
+    assert s_obj["number"] == 1
+    assert s_obj["watched_at"] == "2020-01-01T02:00:00Z"
+    if "episodes" in s_obj:
+        for ep in s_obj["episodes"]:
+            assert ep["watched_at"] == "2020-01-01T02:00:00Z"
     assert shows[0]["watched_at"] == "2020-01-01T02:00:00Z"
 

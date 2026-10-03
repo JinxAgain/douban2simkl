@@ -64,12 +64,23 @@ def test_get_existing_library_ids():
         ]
     }
 
-    with patch.object(client.session, "get", side_effect=[movies_resp, shows_resp]):
+    # Mock anime response
+    anime_resp = MagicMock()
+    anime_resp.status_code = 200
+    anime_resp.json.return_value = {
+        "anime": [
+            {"anime": {"title": "Attack on Titan S2", "ids": {"simkl": 439744, "mal": "25777"}}}
+        ]
+    }
+
+    with patch.object(client.session, "get", side_effect=[movies_resp, shows_resp, anime_resp]):
         ids = client.get_existing_library_ids()
         assert "tt0111161" in ids
         assert "278" in ids
         assert "tt0108778" in ids
         assert "79168" in ids
+        assert "439744" in ids
+        assert "25777" in ids
 
 
 def test_get_existing_library_data():
@@ -101,7 +112,19 @@ def test_get_existing_library_data():
         ]
     }
 
-    with patch.object(client.session, "get", side_effect=[movies_resp, shows_resp]):
+    anime_resp = MagicMock()
+    anime_resp.status_code = 200
+    anime_resp.json.return_value = {
+        "anime": [
+            {
+                "status": "completed",
+                "anime": {"title": "Psycho-Pass 2", "ids": {"simkl": 48928, "mal": "23281"}},
+                "seasons": [{"number": 1}],
+            }
+        ]
+    }
+
+    with patch.object(client.session, "get", side_effect=[movies_resp, shows_resp, anime_resp]):
         data = client.get_existing_library_data()
         assert "tt0111161" in data["movie_ids"]
         assert "278" in data["movie_ids"]
@@ -112,9 +135,13 @@ def test_get_existing_library_data():
         assert ("tt2085059", 1) in data["show_seasons"]
         assert ("tt2085059", 2) not in data["show_seasons"]
         assert "tt2085059" not in data["completed_shows"]
+        assert "48928" in data["show_ids"]
+        assert "48928" in data["completed_shows"]
+        assert ("48928", 1) in data["show_seasons"]
         assert data["show_memos"].get("tt0098936") == "[s01]: Great ; [s02]: Classic"
         assert "tt0111161" in data["all_ids"]
         assert "tt2085059" in data["all_ids"]
+        assert "48928" in data["all_ids"]
 
 
 
