@@ -41,10 +41,16 @@ from douban2simkl.exporter import (
     export_unresolved_items,
     generate_sync_report,
 )
-from douban2simkl.normalizer import build_composite_show_memo, calibrate_rating, normalize_comment
+from douban2simkl.normalizer import (
+    build_composite_show_memo,
+    calibrate_rating,
+    normalize_comment,
+    to_simkl_iso,
+)
 from douban2simkl.resolver import DoubanResolver, extract_season_number
 from douban2simkl.simkl import SimklClient
 from douban2simkl.storage import Storage
+from douban2simkl.tv_grouping import build_tv_season_plan
 
 
 logger = logging.getLogger("douban2simkl")
@@ -568,38 +574,28 @@ def run_pipeline(
                 resolved_records.append(pair)
                 resolve_progress.advance(resolve_task)
 
-    # 4B. Pre-aggregate multi-season comments and IDs for each parent TV series
+    # 4B. Group TV seasons into parent shows, assign reliable season numbers,
+    #     and pre-aggregate multi-season comments per parent show
+    tv_plan = build_tv_season_plan(resolved_records)
     tv_series_comments: Dict[str, Dict[int, str]] = defaultdict(dict)
     tv_series_ids: Dict[str, Dict[str, Any]] = {}
-    record_series_keys: Dict[str, str] = {}
+    # Latest season the user marked "done" on Douban per show: (season, iso_watched_at)
+    tv_latest_done_season: Dict[str, Tuple[int, Optional[str]]] = {}
 
-    for item, resolved in resolved_records:
+    for item, _resolved in resolved_records:
         did = str(item.get("douban_id", ""))
-        title = item.get("title", "")
-        raw_type = item.get("type", "movie")
-        season = resolved.get("season") or extract_season_number(title)
-        is_tv = (raw_type == "tv") or bool(season)
-        if is_tv:
-            eff_s = season or 1
-            s_imdb = resolved.get("series_imdb_id") or resolved.get("imdb_id")
-            s_tmdb = resolved.get("tmdb_id")
-            base_title = re.sub(r"\s*第[一二三四五六七八九十\d]+季.*", "", title, flags=re.I).strip()
-            series_key = s_imdb or (f"tmdb_{s_tmdb}" if s_tmdb else base_title)
-            record_series_keys[did] = series_key
-
-            comment_str = (item.get("comment") or "").strip()
-            if comment_str:
-                tv_series_comments[series_key][eff_s] = comment_str
-
-            if series_key not in tv_series_ids:
-                s_ids: Dict[str, Any] = {}
-                if s_imdb:
-                    s_ids["imdb"] = s_imdb
-                if s_tmdb:
-                    s_ids["tmdb"] = str(s_tmdb)
-                if resolved.get("tvdb_id"):
-                    s_ids["tvdb"] = str(resolved.get("tvdb_id"))
-                tv_series_ids[series_key] = s_ids
+        p = tv_plan.get(did)
+        if not p or p["ambiguous"]:
+            continue
+        gkey = p["group"]
+        tv_series_ids[gkey] = p["ids"]
+        comment_str = (item.get("comment") or "").strip()
+        if comment_str:
+            tv_series_comments[gkey][p["season"]] = comment_str
+        if item.get("status", "done") == "done":
+            prev = tv_latest_done_season.get(gkey)
+            if not prev or p["season"] > prev[0]:
+                tv_latest_done_season[gkey] = (p["season"], to_simkl_iso(item.get("create_time")))
 
     # Pre-build composite memos for each TV show
     tv_composite_memos: Dict[str, str] = {}
@@ -626,10 +622,13 @@ def run_pipeline(
             douban_id = str(item.get("douban_id", ""))
             title = item.get("title", "")
             raw_type = item.get("type", "movie")
-            season = resolved.get("season") or extract_season_number(title)
-            is_tv = (raw_type == "tv") or bool(season)
+            plan = tv_plan.get(douban_id)
+            is_tv = plan is not None
+            season = plan["season"] if plan else None
+            season_ambiguous = bool(plan and plan["ambiguous"])
             status = item.get("status", "done")  # done, mark, doing
             create_time = item.get("create_time", "")
+            watched_at_iso = to_simkl_iso(create_time)
             official_rating = item.get("official_rating") or item.get("rating")
             comment = item.get("comment", "") or ""
 
@@ -647,25 +646,26 @@ def run_pipeline(
 
             record_sync_status = "pending"
 
-            # Build ids dict for Simkl
+            # Build ids dict for Simkl (TV: canonical parent-show ids shared by all seasons)
             ids_dict: Dict[str, Any] = {}
-            target_imdb = series_imdb_id or imdb_id
-            if target_imdb:
-                ids_dict["imdb"] = target_imdb
-            if tmdb_id:
-                ids_dict["tmdb"] = str(tmdb_id)
-            if tvdb_id:
-                ids_dict["tvdb"] = str(tvdb_id)
+            if is_tv:
+                ids_dict = dict(plan["ids"])
+            else:
+                if imdb_id:
+                    ids_dict["imdb"] = imdb_id
+                if tmdb_id:
+                    ids_dict["tmdb"] = str(tmdb_id)
+                if tvdb_id:
+                    ids_dict["tvdb"] = str(tvdb_id)
 
             # Check deduplication against Simkl library
             is_already_in_simkl = False
-            if is_tv:
-                eff_season = season or 1
-                candidate_ids = [series_imdb_id, imdb_id, tmdb_id, tvdb_id]
+            if is_tv and not season_ambiguous:
+                candidate_ids = list(ids_dict.values()) + [series_imdb_id, imdb_id, tmdb_id, tvdb_id]
                 for cid in candidate_ids:
                     if cid:
                         cid_str = str(cid).lower().strip()
-                        if (cid_str, eff_season) in simkl_show_seasons:
+                        if (cid_str, season) in simkl_show_seasons:
                             is_already_in_simkl = True
                             break
                         if cid_str in simkl_completed_shows:
@@ -674,7 +674,7 @@ def run_pipeline(
                         if status in ("mark", "doing") and cid_str in simkl_show_ids:
                             is_already_in_simkl = True
                             break
-            else:
+            elif not is_tv:
                 candidate_ids = [imdb_id, tmdb_id]
                 for cid in candidate_ids:
                     if cid and str(cid).lower().strip() in simkl_movie_ids:
@@ -685,7 +685,19 @@ def run_pipeline(
             # If offline / skip_auth, fall back to local SQLite status.
             is_synced = is_already_in_simkl if simkl_existing_ids else (cached_sync_status == "synced")
 
-            if is_synced:
+            if season_ambiguous and status == "done":
+                # Never guess a season: pushing the wrong number marks the wrong episodes watched
+                unresolved_count += 1
+                record_sync_status = "unresolved_ambiguous_season"
+                unresolved_items.append({
+                    "douban_id": douban_id,
+                    "title": title,
+                    "year": item.get("year"),
+                    "type": "tv",
+                    "status": status,
+                    "reason": "ambiguous season (title has no season number)",
+                })
+            elif is_synced:
                 already_in_simkl_count += 1
                 record_sync_status = "already_synced"
                 if is_already_in_simkl and cached_sync_status != "synced":
@@ -706,22 +718,22 @@ def run_pipeline(
                 # Prepare payload
                 if status == "done":
                     if is_tv:
-                        s_key = record_series_keys.get(douban_id)
-                        comp_memo = tv_composite_memos.get(s_key) if s_key else None
+                        s_key = plan["group"]
+                        comp_memo = tv_composite_memos.get(s_key)
+                        # Always scope to a single season: a show without "seasons" marks the WHOLE show
                         show_obj: Dict[str, Any] = {
                             "ids": ids_dict,
-                            "seasons": [{"number": season or 1}],
+                            "seasons": [{"number": season}],
                         }
                         if calibrated_rating:
                             show_obj["rating"] = calibrated_rating
-                        if create_time:
-                            show_obj["watched_at"] = create_time
+                        if watched_at_iso:
+                            show_obj["watched_at"] = watched_at_iso
                         if comp_memo:
                             show_obj["memo"] = {"text": comp_memo, "is_private": False}
-                            if s_key:
-                                pushed_series_memo_keys.add(s_key)
+                            pushed_series_memo_keys.add(s_key)
                         elif memo_text:
-                            tag = f"[s{season or 1:02d}]: "
+                            tag = f"[s{season:02d}]: "
                             show_obj["memo"] = {"text": f"{tag}{memo_text}"[:140], "is_private": False}
                         history_shows_batch.append(show_obj)
                     else:
@@ -730,8 +742,8 @@ def run_pipeline(
                         }
                         if calibrated_rating:
                             movie_obj["rating"] = calibrated_rating
-                        if create_time:
-                            movie_obj["watched_at"] = create_time
+                        if watched_at_iso:
+                            movie_obj["watched_at"] = watched_at_iso
                         if memo_text:
                             movie_obj["memo"] = {"text": memo_text, "is_private": False}
                         history_movies_batch.append(movie_obj)
@@ -836,10 +848,21 @@ def run_pipeline(
         if current_simkl_memo == comp_memo:
             continue
 
-        memo_updates_batch.append({
+        # IMPORTANT: a show payload without "seasons" makes Simkl mark EVERY episode of the
+        # show as watched at request time. Anchor the memo to the latest season the user
+        # actually watched on Douban (a no-op for already-watched episodes).
+        latest = tv_latest_done_season.get(skey)
+        if not latest:
+            continue
+        latest_season, latest_watched_at = latest
+        memo_obj: Dict[str, Any] = {
             "ids": s_ids,
+            "seasons": [{"number": latest_season}],
             "memo": {"text": comp_memo, "is_private": False},
-        })
+        }
+        if latest_watched_at:
+            memo_obj["watched_at"] = latest_watched_at
+        memo_updates_batch.append(memo_obj)
 
     if memo_updates_batch:
         if not dry_run and not skip_auth:
@@ -1002,8 +1025,56 @@ def main() -> None:
     parser.add_argument("--crawl", action="store_true", help="Force online crawling from Douban even if local archive file exists")
     parser.add_argument("--threads", type=int, default=3, help="Concurrent workers for resolving IMDb IDs (default: 3, max: 5)")
     parser.add_argument("--browser", help="Browser to extract Douban cookies from (e.g. firefox, chrome, edge)")
+    parser.add_argument(
+        "--repair-window",
+        action="append",
+        metavar="START/END",
+        help=(
+            "Repair Simkl episodes stamped inside this local time window by a faulty run, "
+            "e.g. 2026-10-02T19:14/2026-10-02T19:15. Repeatable. Dry-run unless --apply."
+        ),
+    )
+    parser.add_argument("--apply", action="store_true", help="Actually write repair changes to Simkl")
+    parser.add_argument(
+        "--repair-map",
+        action="append",
+        metavar="SIMKL_ID=DOUBAN_ID",
+        help="Manually map an unmatched Simkl entry (e.g. anime sequel) to a Douban record. Repeatable.",
+    )
+    parser.add_argument(
+        "--backup", default="douban_full_backup.jsonl", help="Enriched Douban backup used by --repair-window"
+    )
+    parser.add_argument(
+        "--cleanup-oct2",
+        action="store_true",
+        help="Delete all 51 faulty TV shows/anime from Simkl touched on 2026-10-02, preserving 'The Thick of It' and '35 Up'",
+    )
+    parser.add_argument(
+        "--simkl-dump",
+        help="Path to cached simkl dump json file to speed up scan",
+    )
 
     args = parser.parse_args()
+    if args.cleanup_oct2:
+        run_cleanup_oct2(
+            db_path=args.db,
+            apply=args.apply,
+            simkl_dump_path=args.simkl_dump,
+        )
+        return
+    if args.repair_window:
+        manual_map: Dict[int, str] = {}
+        for spec in args.repair_map or []:
+            sid, did = spec.split("=", 1)
+            manual_map[int(sid.strip())] = did.strip()
+        run_repair(
+            args.repair_window,
+            backup_path=args.backup,
+            db_path=args.db,
+            apply=args.apply,
+            manual_map=manual_map,
+        )
+        return
     run_pipeline(
         input_file=args.input,
         dry_run=args.dry_run,
@@ -1017,5 +1088,124 @@ def main() -> None:
     )
 
 
+def run_repair(
+    window_specs: List[str],
+    backup_path: str,
+    db_path: str,
+    apply: bool = False,
+    manual_map: Optional[Dict[int, str]] = None,
+) -> None:
+    """Undo episodes stamped by a faulty run and re-add Douban seasons with Douban timestamps."""
+    from douban2simkl.repair import (
+        apply_repair,
+        build_repair_plan,
+        fetch_simkl_episode_history,
+        format_repair_report,
+        load_backup,
+        parse_window,
+    )
+
+    print_banner()
+    windows = [parse_window(w) for w in window_specs]
+    storage = Storage(db_path)
+    simkl_client = SimklClient(client_id=config.SIMKL_CLIENT_ID)
+    token = get_or_prompt_simkl_token(simkl_client, storage, dry_run=False)
+    if not token:
+        console.print("[bold red]Simkl authentication failed. Exiting.[/bold red]")
+        sys.exit(1)
+
+    with console.status("[cyan]Fetching Simkl episode history...[/cyan]"):
+        simkl_items = fetch_simkl_episode_history(simkl_client)
+    actions = build_repair_plan(simkl_items, load_backup(backup_path), windows, manual_map=manual_map)
+
+    report = format_repair_report(actions)
+    with open("simkl_repair_plan.md", "w", encoding="utf-8") as f:
+        f.write(report)
+    console.print(report)
+    console.print("[green]Repair plan written to simkl_repair_plan.md[/green]")
+
+    if not apply:
+        console.print("[yellow]Dry-run only. Re-run with --apply to execute this plan.[/yellow]")
+        return
+
+    stats = apply_repair(simkl_client, actions)
+    console.print(
+        f"[bold green]Removed {stats['removed_episodes']} episodes, "
+        f"re-added {stats['readded_seasons']} Douban seasons with original timestamps.[/bold green]"
+    )
+
+    # Verify: nothing should remain inside the faulty windows for the repaired shows
+    repaired_ids = {a["simkl_id"] for a in actions if not a.get("skip")}
+    remaining = build_repair_plan(fetch_simkl_episode_history(simkl_client), [], windows)
+    left = sum(len(v) for a in remaining if a["simkl_id"] in repaired_ids for v in a["damaged"].values())
+    if left:
+        console.print(f"[bold red]Verification: {left} episodes still stamped inside the window(s).[/bold red]")
+    else:
+        console.print("[bold green]Verification passed: no episodes left inside the window(s).[/bold green]")
+
+
+def run_cleanup_oct2(
+    db_path: str = "douban2simkl.db",
+    apply: bool = False,
+    simkl_dump_path: Optional[str] = None,
+) -> None:
+    """Delete all 51 faulty TV shows/anime from Simkl touched on Oct 2, preserving 'The Thick of It' and '35 Up'."""
+    from douban2simkl.repair import (
+        delete_shows_from_simkl,
+        fetch_simkl_episode_history,
+        find_oct2_faulty_shows,
+        format_oct2_cleanup_report,
+        reset_local_sync_state,
+    )
+
+    print_banner()
+    storage = Storage(db_path)
+    simkl_client = SimklClient(client_id=config.SIMKL_CLIENT_ID)
+    token = get_or_prompt_simkl_token(simkl_client, storage, dry_run=False)
+    if not token:
+        console.print("[bold red]Simkl authentication failed. Exiting.[/bold red]")
+        sys.exit(1)
+
+    with console.status("[cyan]Fetching Simkl show and anime history...[/cyan]"):
+        if simkl_dump_path and os.path.exists(simkl_dump_path):
+            with open(simkl_dump_path, "r", encoding="utf-8") as f:
+                dump_data = json.load(f)
+            simkl_items: List[Dict[str, Any]] = []
+            for k in ("shows", "anime"):
+                for it in dump_data.get(k, []):
+                    it["_kind"] = k
+                    simkl_items.append(it)
+        else:
+            simkl_items = fetch_simkl_episode_history(simkl_client)
+
+    delete_list, preserved_list = find_oct2_faulty_shows(simkl_items)
+    report = format_oct2_cleanup_report(delete_list, preserved_list)
+    with open("simkl_oct2_cleanup_plan.md", "w", encoding="utf-8") as f:
+        f.write(report)
+    console.print(report)
+    console.print("[green]Cleanup report written to simkl_oct2_cleanup_plan.md[/green]\n")
+
+    if not apply:
+        console.print(
+            f"[bold yellow]DRY-RUN ONLY: Found {len(delete_list)} shows to delete and {len(preserved_list)} to preserve.\n"
+            "Run with --apply to actually delete these shows from Simkl and reset local DB sync status.[/bold yellow]"
+        )
+        return
+
+    with console.status(f"[cyan]Deleting {len(delete_list)} shows from Simkl and clearing ratings...[/cyan]"):
+        stats = delete_shows_from_simkl(simkl_client, delete_list)
+
+    with console.status("[cyan]Resetting sync status in local database...[/cyan]"):
+        reset_count = reset_local_sync_state(db_path, delete_list)
+
+    console.print(
+        f"[bold green][OK] Successfully deleted {stats['deleted_shows']} shows from Simkl!\n"
+        f"[OK] Cleared ratings for {stats['deleted_ratings']} shows.\n"
+        f"[OK] Reset {reset_count} Douban items in local sync_state database.\n"
+        "You can now run 'python run.py' to cleanly re-sync all watch history with accurate timestamps![/bold green]"
+    )
+
+
 if __name__ == "__main__":
     main()
+

@@ -1,6 +1,7 @@
 """Rating calibration engine and comment normalization for Simkl."""
 
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 CHINESE_HALF_STARS = {
@@ -14,6 +15,46 @@ CHINESE_HALF_STARS = {
 UNIT_PATTERN = re.compile(r"^[0-9.]+\s*(?:小时|h|点|号|月|mm|cm|寸|岁|集)", re.I)
 HALF_STAR_PATTERN = re.compile(r"(?:^|[^\d.])([1-4]\.5)(?:[^\d.]|$)")
 TEN_POINT_PATTERN = re.compile(r"(?:^|[^\d.])(10|[1-9](?:\.[0-9])?)\s*(?:/10|分)(?:[^\d.]|$)")
+
+# Douban displays and exports all timestamps in Beijing time (UTC+8, no DST)
+DOUBAN_TZ = timezone(timedelta(hours=8))
+
+
+def to_simkl_iso(create_time: Optional[str]) -> Optional[str]:
+    """Convert a Douban timestamp (e.g. '2017-11-29 00:08:15', Beijing time) to Simkl ISO-8601 UTC.
+
+    Simkl only honours ISO-8601 'watched_at' values; anything else silently falls back to
+    the request time, which stamps every item with the moment the script ran.
+    Returns None if the value cannot be parsed, so callers can omit the field.
+    """
+    if not create_time:
+        return None
+    raw = str(create_time).strip()
+    if not raw:
+        return None
+
+    # Already ISO-8601 with explicit offset or Z
+    try:
+        if raw.endswith("Z"):
+            dt = datetime.fromisoformat(raw[:-1]).replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        pass
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(raw, fmt).replace(tzinfo=DOUBAN_TZ)
+            return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            continue
+
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=DOUBAN_TZ)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
 
 
 def calibrate_rating(

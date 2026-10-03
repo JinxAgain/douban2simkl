@@ -216,6 +216,121 @@ def test_cli_tv_memo_independent_sync_pass(tmp_path):
     assert len(pushed_batches) == 1
     memo_payload = pushed_batches[0]["shows"][0]
     assert memo_payload["ids"]["imdb"] == "tt0306414"
-    assert "seasons" not in memo_payload
     assert memo_payload["memo"]["text"] == "[s01]: 神作启幕 ; [s02]: 格局更宏大"
+    # A show payload WITHOUT seasons marks the ENTIRE show as watched on Simkl (at request time).
+    # The memo pass must always be scoped to a season the user actually watched on Douban.
+    assert memo_payload.get("seasons"), "memo payload must never omit seasons (would mark whole show watched)"
+    assert memo_payload["seasons"] == [{"number": 2}]
+
+
+def _run_tv_pipeline(tmp_path, items, resolved, lib_data):
+    """Helper: run the pipeline with mocked resolver/Simkl and return pushed history batches."""
+    from douban2simkl.storage import Storage
+
+    archive_file = tmp_path / "archive.jsonl"
+    db_file = tmp_path / "pipeline.db"
+    storage = Storage(str(db_file))
+    storage.set_setting("simkl_access_token", "test_mock_token")
+    with open(archive_file, "w", encoding="utf-8") as f:
+        for it in items:
+            f.write(json.dumps(it, ensure_ascii=False) + "\n")
+
+    pushed_batches = []
+
+    def fake_sync_history(movies=None, shows=None):
+        pushed_batches.append({
+            "movies": [dict(m) for m in movies] if movies else None,
+            "shows": [dict(s) for s in shows] if shows else None,
+        })
+        return {"added": {"movies": 0, "shows": 0, "episodes": 0}}
+
+    with patch("douban2simkl.cli.DoubanResolver.resolve_item", MagicMock(side_effect=resolved)), \
+         patch("douban2simkl.cli.DoubanResolver.batch_resolve_wikidata", return_value={}), \
+         patch("douban2simkl.cli.DoubanResolver.batch_resolve_parent_series_wikidata", return_value={}), \
+         patch("time.sleep", return_value=None), \
+         patch("douban2simkl.cli.SimklClient.verify_token", return_value=True), \
+         patch("douban2simkl.cli.SimklClient.get_existing_library_data", return_value=lib_data), \
+         patch("douban2simkl.cli.SimklClient.sync_history_batch", side_effect=fake_sync_history), \
+         patch("douban2simkl.cli.export_full_backup", return_value=len(items)), \
+         patch("douban2simkl.cli.export_simkl_failed_items"), \
+         patch("douban2simkl.cli.generate_sync_report", return_value=""):
+        run_pipeline(
+            input_file=str(archive_file),
+            dry_run=False,
+            db_path=str(db_file),
+            skip_auth=False,
+            threads=1,
+        )
+    return pushed_batches
+
+
+def _empty_lib():
+    return {
+        "movie_ids": set(),
+        "show_ids": set(),
+        "show_seasons": set(),
+        "completed_shows": set(),
+        "show_memos": {},
+        "all_ids": set(),
+    }
+
+
+def test_cli_tv_watched_at_uses_douban_time_in_iso_utc(tmp_path):
+    items = [
+        {"douban_id": "4001", "title": "行尸走肉 第八季", "type": "tv", "status": "done",
+         "create_time": "2017-11-29 00:08:15", "rating": 5},
+    ]
+    resolved = [
+        {"douban_id": "4001", "imdb_id": "tt6156390", "series_imdb_id": "tt1520211",
+         "tmdb_id": "1402", "season": 8, "title": "行尸走肉 第八季"},
+    ]
+    batches = _run_tv_pipeline(tmp_path, items, resolved, _empty_lib())
+    show = batches[0]["shows"][0]
+    assert show["seasons"] == [{"number": 8}]
+    # Douban timestamps are Beijing time (UTC+8); Simkl requires ISO-8601 UTC.
+    assert show["watched_at"] == "2017-11-28T16:08:15Z"
+
+
+def test_cli_tv_trailing_digit_season_grouped_by_shared_tmdb(tmp_path):
+    # Douban names later seasons like "俗女养成记2" (no "第X季"); both share TMDb show 92925.
+    items = [
+        {"douban_id": "5001", "title": "俗女养成记", "type": "tv", "status": "done",
+         "create_time": "2021-09-22 23:26:52", "comment": "很好看"},
+        {"douban_id": "5002", "title": "俗女养成记2", "type": "tv", "status": "done",
+         "create_time": "2021-10-17 21:35:06", "comment": "干！看的真爽"},
+    ]
+    resolved = [
+        {"douban_id": "5001", "imdb_id": "tt10752444", "series_imdb_id": None,
+         "tmdb_id": "92925", "season": None, "title": "俗女养成记"},
+        {"douban_id": "5002", "imdb_id": "tt15207202", "series_imdb_id": None,
+         "tmdb_id": "92925", "season": None, "title": "俗女养成记2"},
+    ]
+    batches = _run_tv_pipeline(tmp_path, items, resolved, _empty_lib())
+    shows = [s for b in batches for s in (b["shows"] or [])]
+    seasons_pushed = sorted(s["seasons"][0]["number"] for s in shows)
+    assert seasons_pushed == [1, 2]
+    for s in shows:
+        assert s["memo"]["text"] == "[s01]: 很好看 ; [s02]: 干！看的真爽"
+
+
+def test_cli_tv_ambiguous_season_is_not_guessed_as_season_one(tmp_path):
+    # "鬼灭之刃：游郭篇" shares the TMDb show with "鬼灭之刃" but carries no season number.
+    # It must NOT be pushed as season 1 (that would mark the wrong season watched).
+    items = [
+        {"douban_id": "6001", "title": "鬼灭之刃", "type": "tv", "status": "done",
+         "create_time": "2020-01-01 10:00:00"},
+        {"douban_id": "6002", "title": "鬼灭之刃：游郭篇", "type": "tv", "status": "done",
+         "create_time": "2022-02-14 10:00:00"},
+    ]
+    resolved = [
+        {"douban_id": "6001", "imdb_id": "tt9335498", "series_imdb_id": None,
+         "tmdb_id": "85937", "season": None, "title": "鬼灭之刃"},
+        {"douban_id": "6002", "imdb_id": "tt15757634", "series_imdb_id": None,
+         "tmdb_id": "85937", "season": None, "title": "鬼灭之刃：游郭篇"},
+    ]
+    batches = _run_tv_pipeline(tmp_path, items, resolved, _empty_lib())
+    shows = [s for b in batches for s in (b["shows"] or [])]
+    assert len(shows) == 1
+    assert shows[0]["seasons"] == [{"number": 1}]
+    assert shows[0]["watched_at"] == "2020-01-01T02:00:00Z"
 
