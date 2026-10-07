@@ -90,7 +90,8 @@ def test_get_existing_library_data():
     movies_resp.status_code = 200
     movies_resp.json.return_value = {
         "movies": [
-            {"movie": {"title": "Shawshank", "ids": {"imdb": "tt0111161", "tmdb": 278}}}
+            {"status": "completed", "movie": {"title": "Shawshank", "ids": {"imdb": "tt0111161", "tmdb": 278}}},
+            {"status": "plantowatch", "movie": {"title": "Obsession", "ids": {"imdb": "tt37287335"}}},
         ]
     }
 
@@ -128,6 +129,10 @@ def test_get_existing_library_data():
         data = client.get_existing_library_data()
         assert "tt0111161" in data["movie_ids"]
         assert "278" in data["movie_ids"]
+        assert "tt0111161" in data["completed_movies"]
+        assert "278" in data["completed_movies"]
+        assert "tt37287335" in data["movie_ids"]
+        assert "tt37287335" not in data["completed_movies"]
         assert "tt0098936" in data["show_ids"]
         assert "tt0098936" in data["completed_shows"]
         assert ("tt0098936", 1) in data["show_seasons"]

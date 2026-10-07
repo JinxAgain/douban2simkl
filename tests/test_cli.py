@@ -267,12 +267,39 @@ def _run_tv_pipeline(tmp_path, items, resolved, lib_data):
 def _empty_lib():
     return {
         "movie_ids": set(),
+        "completed_movies": set(),
         "show_ids": set(),
         "show_seasons": set(),
         "completed_shows": set(),
         "show_memos": {},
         "all_ids": set(),
     }
+
+
+def test_cli_movie_plantowatch_in_simkl_upgraded_to_watched(tmp_path):
+    # If a movie is already in Simkl watchlist (plantowatch) but marked 'done' on Douban,
+    # it must NOT be skipped as 'already_synced'; it must be pushed to history.
+    items = [
+        {"douban_id": "7001", "title": "Obsession", "type": "movie", "status": "done",
+         "create_time": "2026-07-03 04:06:29", "rating": 3.5},
+    ]
+    resolved = [
+        {"douban_id": "7001", "imdb_id": "tt37287335", "title": "Obsession"},
+    ]
+    lib_data = {
+        "movie_ids": {"tt37287335"},  # Present in watchlist on Simkl
+        "completed_movies": set(),    # NOT in completed
+        "show_ids": set(),
+        "show_seasons": set(),
+        "completed_shows": set(),
+        "show_memos": {},
+        "all_ids": {"tt37287335"},
+    }
+    batches = _run_tv_pipeline(tmp_path, items, resolved, lib_data)
+    movies = [m for b in batches for m in (b["movies"] or [])]
+    assert len(movies) == 1
+    assert movies[0]["ids"]["imdb"] == "tt37287335"
+    assert movies[0]["watched_at"] == "2026-07-02T20:06:29Z"
 
 
 def test_cli_tv_watched_at_uses_douban_time_in_iso_utc(tmp_path):

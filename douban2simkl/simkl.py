@@ -189,24 +189,29 @@ class SimklClient:
                 - 'all_ids': Set[str] of all media IDs (union of movie and show IDs)
         """
         movie_ids: Set[str] = set()
+        completed_movies: Set[str] = set()
         show_ids: Set[str] = set()
         show_seasons: Set[Tuple[str, int]] = set()
         completed_shows: Set[str] = set()
 
-        # 1. Fetch movies
+        # 1. Fetch movies with full status (to distinguish completed vs plantowatch/watching)
         movies_url = f"{SIMKL_API_BASE}/sync/all-items/movies"
         try:
-            resp = self.session.get(movies_url, params={"extended": "ids_only"}, timeout=30)
+            resp = self.session.get(movies_url, params={"extended": "full"}, timeout=30)
             if resp.status_code == 200:
                 data = resp.json()
                 for list_key in ("movies", "anime"):
                     items = data.get(list_key, [])
                     for item in items:
                         target = item.get("movie") or item.get("anime") or item
+                        st = str(item.get("status", "")).lower()
                         ids_dict = target.get("ids", {})
                         for val in ids_dict.values():
                             if val:
-                                movie_ids.add(str(val).lower().strip())
+                                val_str = str(val).lower().strip()
+                                movie_ids.add(val_str)
+                                if st == "completed":
+                                    completed_movies.add(val_str)
             else:
                 logger.warning("Failed to fetch movie library from %s: HTTP %d", movies_url, resp.status_code)
         except Exception as e:
@@ -266,6 +271,7 @@ class SimklClient:
         all_ids = movie_ids.union(show_ids)
         return {
             "movie_ids": movie_ids,
+            "completed_movies": completed_movies,
             "show_ids": show_ids,
             "show_seasons": show_seasons,
             "completed_shows": completed_shows,

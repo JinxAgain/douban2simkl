@@ -289,6 +289,7 @@ def run_pipeline(
 
     # Step 3: Fetch Simkl Library for Deduplication
     simkl_movie_ids: Set[str] = set()
+    simkl_completed_movies: Set[str] = set()
     simkl_show_ids: Set[str] = set()
     simkl_show_seasons: Set[Tuple[str, int]] = set()
     simkl_completed_shows: Set[str] = set()
@@ -298,6 +299,7 @@ def run_pipeline(
         with console.status("[cyan]Fetching existing library from Simkl for deduplication...[/cyan]"):
             library_data = simkl_client.get_existing_library_data()
             simkl_movie_ids = library_data["movie_ids"]
+            simkl_completed_movies = library_data.get("completed_movies", set())
             simkl_show_ids = library_data["show_ids"]
             simkl_show_seasons = library_data["show_seasons"]
             simkl_completed_shows = library_data["completed_shows"]
@@ -677,9 +679,18 @@ def run_pipeline(
             elif not is_tv:
                 candidate_ids = [imdb_id, tmdb_id]
                 for cid in candidate_ids:
-                    if cid and str(cid).lower().strip() in simkl_movie_ids:
-                        is_already_in_simkl = True
-                        break
+                    if cid:
+                        cid_str = str(cid).lower().strip()
+                        if status == "done":
+                            # A watched movie is only already synced if completed in Simkl
+                            if cid_str in simkl_completed_movies:
+                                is_already_in_simkl = True
+                                break
+                        elif status in ("mark", "doing"):
+                            # A watchlist item is already in Simkl if present in any list
+                            if cid_str in simkl_movie_ids:
+                                is_already_in_simkl = True
+                                break
 
             # If connected to Simkl, live Simkl state is ground truth.
             # If offline / skip_auth, fall back to local SQLite status.
