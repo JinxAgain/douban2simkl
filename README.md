@@ -27,7 +27,7 @@ English | [中文说明](#中文说明)
   - Automatically truncates comments to Simkl's 140-character memo limit.
   - Preserves all full-length long reviews (>140 chars) into a beautifully formatted Markdown archive (`long_reviews_archive.md`).
 - **Zero-Friction Authentication**:
-  - Automatically detects `.douban.com` cookies from local browsers (Chrome, Edge, Firefox, Brave, Safari) without manual cookie export.
+  - Automatically detects `.douban.com` cookies from local browsers without manual cookie export (on Windows, **Firefox** must be used; see compatibility note below).
   - One-click OAuth2 Device PIN flow: open `https://simkl.com/pin`, enter the displayed code, and start syncing immediately.
 - **Smart Deduplication & Local Cache**:
   - Pre-fetches your existing Simkl library to prevent duplicate scrobbles.
@@ -83,7 +83,7 @@ python run.py --input path/to/douban_archive.jsonl
 
 Force crawling Douban collections even if a local archive file exists:
 ```bash
-python run.py --crawl
+python run.py --crawl --browser firefox
 ```
 
 ### 5. Adjust Concurrency and Limits
@@ -115,9 +115,21 @@ SIMKL_CLIENT_SECRET=
 TMDB_API_KEY=
 OMDB_API_KEY=
 
-# Optional: Douban Cookie (Leave blank to auto-detect from local browsers)
+# Optional: Douban Cookie (Leave blank to auto-detect from Firefox, or paste manual cookie)
 DOUBAN_COOKIE=
 ```
+
+> [!IMPORTANT]
+> **Windows Browser Cookie Compatibility (Chrome / Edge vs. Firefox):**
+> On Windows, modern **Chrome and Edge (v127+) enforce App-Bound Encryption (ABE)** on their cookie database (`v20` cookies). External scripts and libraries cannot decrypt these cookies because decryption is strictly bound to the official browser binary.
+> - **Auto-detection**: You **must use Firefox** (which does not use Chromium's Windows ABE architecture) and ensure you are logged into `douban.com` in Firefox:
+>   ```bash
+>   python run.py --crawl --browser firefox
+>   ```
+> - **Manual Cookie (Recommended)**: Alternatively, log in to Douban in Chrome/Edge, open DevTools (`F12` -> `Network`), copy the `Cookie` header from any request to `douban.com`, and set it in `.env`:
+>   ```env
+>   DOUBAN_COOKIE="bid=...; dbcl2=...; ck=..."
+>   ```
 
 > [!NOTE]
 > You do **not** need to manually fill in `SIMKL_ACCESS_TOKEN`. The interactive CLI automatically acquires and securely persists your token via the official Simkl PIN device flow.
@@ -151,8 +163,8 @@ DOUBAN_COOKIE=
 3. **半星评分智能校准**：自动识别短评中的半星打分（例如 `3.5星`、`四星半`、`7/10`），自动换算为 Simkl 的 1-10 分制。
 4. **长评自动归档**：超过 Simkl 140 字限制的长篇短评自动归档至独立优美的 Markdown 文件（`long_reviews_archive.md`）。
 5. **极简认证体验**：
-   - 豆瓣：自动检测本机浏览器 Cookie，无需抓包复制。
-   - Simkl：内置官方 OAuth2 Device PIN 认证，在浏览器打开 `https://simkl.com/pin` 输入 4 位码即可完成授权。
+   - **豆瓣**：支持自动检测浏览器 Cookie。**注意：在 Windows 环境下，Chrome 与 Edge (v127+) 引入了 App-Bound Encryption (ABE) 应用绑定加密，外部脚本无法解密其 Cookie；若需全自动读取，必须使用未采用该机制的 Firefox 浏览器，或者在 `.env` 中手动配置 `DOUBAN_COOKIE`**。
+   - **Simkl**：内置官方 OAuth2 Device PIN 认证，在浏览器打开 `https://simkl.com/pin` 输入 4 位码即可完成授权。
 6. **失败与未匹配条目清晰导出**：
    - `unresolved_items.md`：导出所有未匹配到 ID 的条目（附豆瓣链接）。
    - `simkl_failed_sync.md`：导出同步 Simkl 失败或未收录的条目（附失败原因与豆瓣链接）。
